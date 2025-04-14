@@ -1,4 +1,4 @@
-# ERA5 Download Script Modified Based on Research
+# ERA5 Download Script 
 
 # Add your API key to the ~/.cdsapirc file on your computer in the following format:
 # url: https://cds.climate.copernicus.eu/api/v2
