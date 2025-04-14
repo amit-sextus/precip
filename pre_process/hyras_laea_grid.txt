@@ -1,0 +1,17 @@
+gridtype = projection
+gridsize = 1320000
+xsize = 1200
+ysize = 1100
+xfirst = 3805500  # From ncdump output
+xinc = 1000
+yfirst = 2486500  # From ncdump output
+yinc = 1000
+xunits = "m"
+yunits = "m"
+grid_mapping_name = lambert_azimuthal_equal_area
+latitude_of_projection_origin = 52.
+longitude_of_projection_origin = 10.
+false_easting = 4321000.
+false_northing = 3210000.
+semi_major_axis = 6378137.
+semi_minor_axis = 6356752.31414036

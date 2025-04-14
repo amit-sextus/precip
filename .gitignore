@@ -1,0 +1,32 @@
+# Data files
+# Ignore everything IN the data directory first
+data/*
+
+# BUT, do NOT ignore the data module script itself
+!data/mswep_data_module_2.py
+# And don't ignore the directory itself, so the file above can be tracked
+!data/
+
+# Third-party packages
+isodisreg/
+
+# Log directories
+hyperparam_search_logs/
+logs/
+
+# Results and output directories
+hyperparam_search_results/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Environment files (optional, add if needed)
+# .env
+# environment.yml
+
+# OS-specific files
+.DS_Store
+
+# Editor/IDE specific files
+.vscode/ 
