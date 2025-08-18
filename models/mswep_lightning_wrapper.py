@@ -7,22 +7,33 @@ import multiprocessing
 from tqdm import tqdm
 from models.mswep_evaluation import calculate_crps_idr
 from data.mswep_data_module_2 import TargetLogScaler  # Import TargetLogScaler
+# Note: MSWEPUNet import would be: from models.mswep_unet import MSWEPUNet
 
 class UNetLightningModule(L.LightningModule):
     """
     Lightning Module wrapper for any UNet model.
     
     This wrapper handles the UNet model for MSWEP precipitation forecasting.
-    The model takes 3 input channels representing precipitation at days t-3, t-2, and t-1,
-    and predicts precipitation at day t.
+    The model supports dynamic input channels:
+    - Default: 5 channels (3 precipitation lags + 2 seasonality features)
+    - With ERA5: 5 base channels + 3*M ERA5 channels (M = number of ERA5 variables)
+    
+    Example usage:
+        # Without ERA5
+        model = MSWEPUNet(in_channels=5)
+        lightning_module = UNetLightningModule(model, ...)
+        
+        # With ERA5 (e.g., 6 variables)
+        model = MSWEPUNet(in_channels=23)  # 5 + 3*6 = 23
+        lightning_module = UNetLightningModule(model, ...)
     
     It also integrates a postprocessing step using IDR (EasyUQ) to convert deterministic
     forecasts into calibrated probabilistic forecasts.
     """
     def __init__(self, model, learning_rate=0.0001, loss_type='mse', intensity_weights=None, focal_gamma=2.0,
                  optimizer_type='adam', lr_scheduler_type='cosineannealinglr', 
-                 use_regional_focus=True, region_weight=1.0, outside_weight=0.2, log_offset=0.01,
-                 weight_decay=1e-3):
+                 use_regional_focus=True, region_weight=1.0, outside_weight=0.2, 
+                 target_scaler=None, weight_decay=1e-3):
         """
         Initialize the UNetLightningModule.
         
@@ -33,21 +44,25 @@ class UNetLightningModule(L.LightningModule):
             intensity_weights: Optional dictionary with intensity ranges and weights
             focal_gamma: Gamma parameter for focal loss
             optimizer_type: Type of optimizer to use ('adam' or 'adamw'; default 'adam')
-            lr_scheduler_type: Type of learning rate scheduler ('cosineannealinglr' or 'cosineannealingwarmrestarts'; default 'cosineannealinglr')
+            lr_scheduler_type: Type of learning rate scheduler ('cosineannealinglr', 'cosineannealingwarmrestarts', 'reducelronplateau', 'doubledescent', 'constant'; default 'doubledescent')
             use_regional_focus: Whether to apply regional weighting to the loss calculation
             region_weight: Weight for target region (Germany)
             outside_weight: Weight for areas outside target region
-            log_offset: Offset to use in log transform of precipitation data (default 0.01)
+            target_scaler: TargetLogScaler instance from DataModule (replaces log_offset parameter)
             weight_decay: Weight decay for optimizer (L2 regularization)
         """
         super().__init__()
         
-        self.save_hyperparameters(ignore=['model'])
+        self.save_hyperparameters(ignore=['model', 'target_scaler'])
         
         self.model = model
         
-        # Create the target scaler for log transformation
-        self.target_scaler = TargetLogScaler(offset=log_offset)
+        # Use the target scaler from DataModule instead of creating a new one
+        self.target_scaler = target_scaler
+        if self.target_scaler is not None:
+            print(f"UNetLightningModule: Using provided TargetLogScaler with offset={self.target_scaler.offset}")
+        else:
+            print("UNetLightningModule: No target scaler provided - working with original scale only")
         
         self.loss_type = loss_type
         self.loss_fn = self.configure_loss_function(
@@ -59,14 +74,15 @@ class UNetLightningModule(L.LightningModule):
         self.mae_metric = MeanAbsoluteError()
         self.rmse_metric = MeanSquaredError()
         
-        # Store best validation metrics observed so far
+        # Store best validation metrics observed so far (both scales)
         self.best_val_loss = float('inf')
-        self.best_val_mae = None
-        self.best_val_rmse = None
+        self.best_val_mae_log = None      # MAE in log scale (for training monitoring)
+        self.best_val_rmse_log = None     # RMSE in log scale
+        self.best_val_mae_mm = None       # MAE in original scale (for real-world interpretation)
+        self.best_val_rmse_mm = None      # RMSE in original scale
         
-        # Lists to store predictions and targets across epochs for CRPS calculation
-        self.training_step_preds = []
-        self.training_step_targets = []
+        # Lists to store validation predictions and targets for CRPS calculation
+        # No longer accumulating training predictions - we'll collect those after training
         self.validation_step_preds = []
         self.validation_step_targets = []
     
@@ -92,10 +108,10 @@ class UNetLightningModule(L.LightningModule):
     
     def training_step(self, batch, batch_idx: int):
         """Training step with gradient clipping and mixed-precision stability."""
-        x, y_original, y_for_transform = batch
+        x, y_original, y_transformed = batch
         
-        # Apply log transform to target
-        y_scaled = self.target_scaler.transform(y_for_transform)
+        # y_transformed is already log-transformed (if enabled) from DataModule
+        # y_original is always in original scale for evaluation
         
         y_hat = self(x)
         
@@ -103,7 +119,7 @@ class UNetLightningModule(L.LightningModule):
         y_hat = y_hat.squeeze(1)  # Convert from [B,1,H,W] to [B,H,W]
         
         # Handle potential NaNs in both prediction and transformed target
-        mask = ~(torch.isnan(y_scaled) | torch.isnan(y_hat))
+        mask = ~(torch.isnan(y_transformed) | torch.isnan(y_hat))
         
         if mask.sum() == 0:
             # If all values are NaN, return zero loss but log this issue
@@ -111,19 +127,23 @@ class UNetLightningModule(L.LightningModule):
             # Return small non-zero loss to avoid NaN gradients
             return torch.tensor(0.01, device=self.device, requires_grad=True)
         
-        # Compute loss only on non-NaN values
+        # Compute loss only on non-NaN values using transformed targets
         y_hat_masked = torch.where(mask, y_hat, torch.zeros_like(y_hat))
-        y_scaled_masked = torch.where(mask, y_scaled, torch.zeros_like(y_scaled))
+        y_transformed_masked = torch.where(mask, y_transformed, torch.zeros_like(y_transformed))
         
-        # Calculate element-wise loss (squared error for MSE)
+        # Calculate element-wise loss based on loss type
         # Use the masked versions to avoid NaNs in calculation where possible
-        elementwise_loss = F.mse_loss(y_hat_masked, y_scaled_masked, reduction='none') 
+        if self.loss_type == 'mae':
+            elementwise_loss = F.l1_loss(y_hat_masked, y_transformed_masked, reduction='none')
+        else:
+            # For MSE and MSE-based losses (weighted_mse, focal_mse, etc.)
+            elementwise_loss = F.mse_loss(y_hat_masked, y_transformed_masked, reduction='none')
 
         # Apply regional weighting conditionally
         if self.hparams.use_regional_focus:
             # Check if inner model has the mask attribute
-            if hasattr(self.model, 'germany_mask') and self.model.germany_mask is not None:
-                weight_mask = self.model.germany_mask.to(elementwise_loss.device)
+            if hasattr(self.model, 'spatial_weight_mask') and self.model.spatial_weight_mask is not None:
+                weight_mask = self.model.spatial_weight_mask.to(elementwise_loss.device)
 
                 # Apply weights to element-wise loss
                 # Make sure weight_mask has compatible dimensions for broadcasting (e.g., HxW)
@@ -134,7 +154,7 @@ class UNetLightningModule(L.LightningModule):
                 loss = torch.sum(weighted_loss_elements[mask]) / mask.sum().clamp(min=1) # Safe division
 
             else:
-                print("Warning: use_regional_focus=True but self.model.germany_mask not found. Using unweighted loss.")
+                print("Warning: use_regional_focus=True but self.model.spatial_weight_mask not found. Using unweighted loss.")
                 # Fallback to unweighted loss if mask is missing
                 loss = torch.mean(elementwise_loss[mask]) # Average only over valid pixels
         else:
@@ -149,56 +169,74 @@ class UNetLightningModule(L.LightningModule):
             nan_pct = 100 * (~mask).float().mean()
             self.log("nan_percentage", nan_pct, prog_bar=True, sync_dist=True)
             
-            # Calculate MAE and RMSE only for Germany region
+            # Calculate metrics for Germany region in BOTH scales
             if mask.sum() > 0 and self.hparams.use_regional_focus and hasattr(self.model, 'germany_mask'):
                 # Get the Germany mask
-                weight_mask = self.model.germany_mask.to(mask.device)
-                # Get the region_weight value - this will be the exact weight assigned to Germany
-                region_weight = self.hparams.region_weight if hasattr(self.hparams, 'region_weight') else 1.0
-                # Germany is defined as areas with weight equal to region_weight
-                germany_region = (weight_mask == region_weight).to(mask.device)
+                germany_mask = self.model.germany_mask.to(mask.device)
                 
                 # Combine with the valid data mask (non-NaN values)
-                germany_valid_mask = mask & germany_region.expand_as(mask)
+                germany_valid_mask = mask & germany_mask.expand_as(mask)
                 
                 if germany_valid_mask.sum() > 0:
-                    # Calculate metrics only for valid points in Germany
-                    germany_mae = torch.abs(y_hat_masked[germany_valid_mask] - y_scaled_masked[germany_valid_mask]).mean()
-                    germany_mse = ((y_hat_masked[germany_valid_mask] - y_scaled_masked[germany_valid_mask]) ** 2).mean()
-                    germany_rmse = torch.sqrt(germany_mse)
+                    # Calculate LOG SCALE metrics (used for loss computation)
+                    germany_mae_log = torch.abs(y_hat_masked[germany_valid_mask] - y_transformed_masked[germany_valid_mask]).mean()
+                    germany_mse_log = ((y_hat_masked[germany_valid_mask] - y_transformed_masked[germany_valid_mask]) ** 2).mean()
+                    germany_rmse_log = torch.sqrt(germany_mse_log)
                     
-                    self.log("train_mae", germany_mae, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-                    self.log("train_rmse", germany_rmse, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+                    self.log("train_mae_log", germany_mae_log, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+                    self.log("train_rmse_log", germany_rmse_log, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+                    
+                    # Calculate ORIGINAL SCALE metrics (for real-world interpretation)
+                    if self.target_scaler is not None:
+                        y_hat_orig = self.target_scaler.inverse_transform(y_hat_masked[germany_valid_mask])
+                    else:
+                        y_hat_orig = y_hat_masked[germany_valid_mask]
+                    
+                    y_original_masked = y_original[germany_valid_mask]
+                    germany_mae_mm = torch.abs(y_hat_orig - y_original_masked).mean()
+                    germany_mse_mm = ((y_hat_orig - y_original_masked) ** 2).mean()
+                    germany_rmse_mm = torch.sqrt(germany_mse_mm)
+                    
+                    self.log("train_mae_mm", germany_mae_mm, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+                    self.log("train_rmse_mm", germany_rmse_mm, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+                    
                 else:
                     # If no valid points in Germany, log zero metrics
-                    self.log("train_mae", torch.tensor(0.0, device=self.device), prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-                    self.log("train_rmse", torch.tensor(0.0, device=self.device), prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+                    for metric_suffix in ["_log", "_mm"]:
+                        self.log(f"train_mae{metric_suffix}", torch.tensor(0.0, device=self.device), prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+                        self.log(f"train_rmse{metric_suffix}", torch.tensor(0.0, device=self.device), prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
             else:
                 # Fallback to calculating metrics on all valid points if Germany mask is unavailable
-                mae = self.mae_metric(y_hat_masked[mask], y_scaled_masked[mask])
-                mse = self.rmse_metric(y_hat_masked[mask], y_scaled_masked[mask])
-                rmse = torch.sqrt(mse)
-                self.log("train_mae", mae, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-                self.log("train_rmse", rmse, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-            
-            # Apply inverse transform to get predictions back to original scale
-            y_hat_rescaled = self.target_scaler.inverse_transform(y_hat.detach())
+                # LOG SCALE metrics
+                mae_log = self.mae_metric(y_hat_masked[mask], y_transformed_masked[mask])
+                mse_log = self.rmse_metric(y_hat_masked[mask], y_transformed_masked[mask])
+                rmse_log = torch.sqrt(mse_log)
+                self.log("train_mae_log", mae_log, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+                self.log("train_rmse_log", rmse_log, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+                
+                # ORIGINAL SCALE metrics
+                if self.target_scaler is not None:
+                    y_hat_orig_all = self.target_scaler.inverse_transform(y_hat_masked[mask])
+                else:
+                    y_hat_orig_all = y_hat_masked[mask]
+                
+                mae_mm = torch.abs(y_hat_orig_all - y_original[mask]).mean()
+                mse_mm = ((y_hat_orig_all - y_original[mask]) ** 2).mean()
+                rmse_mm = torch.sqrt(mse_mm)
+                self.log("train_mae_mm", mae_mm, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+                self.log("train_rmse_mm", rmse_mm, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         
         # Apply gradient clipping to prevent exploding gradients
         # Important for precipitation data with occasional extremes
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         
-        # Store predictions and targets for potential later CRPS postprocessing
-        self.training_step_preds.append(y_hat_rescaled)
-        self.training_step_targets.append(y_original.detach())
-        
         return loss
     
     def validation_step(self, batch, batch_idx: int):
-        x, y_original, y_for_transform = batch
+        x, y_original, y_transformed = batch
         
-        # Apply log transform to target
-        y_scaled = self.target_scaler.transform(y_for_transform)
+        # y_transformed is already log-transformed (if enabled) from DataModule
+        # y_original is always in original scale for evaluation
         
         # Forward pass with memory optimization
         with torch.amp.autocast('cuda', enabled=self.trainer.precision != 32):
@@ -208,7 +246,7 @@ class UNetLightningModule(L.LightningModule):
         y_hat = y_hat.squeeze(1)
         
         # Handle NaNs properly
-        mask = ~(torch.isnan(y_scaled) | torch.isnan(y_hat))
+        mask = ~(torch.isnan(y_transformed) | torch.isnan(y_hat))
         
         if mask.sum() == 0:
             # If all values are NaN, log a warning and assign a poor performance score.
@@ -216,21 +254,26 @@ class UNetLightningModule(L.LightningModule):
             # Return high fallback loss to avoid misleading the early stopping callback
             fallback_loss = torch.tensor(100.0, device=self.device, requires_grad=True)
             self.log("val_loss", fallback_loss, prog_bar=True, on_epoch=True, sync_dist=True)
-            self.log("val_mae", torch.tensor(100.0, device=self.device), prog_bar=True, on_epoch=True, sync_dist=True)
-            self.log("val_rmse", torch.tensor(100.0, device=self.device), prog_bar=True, on_epoch=True, sync_dist=True)
+            for metric_suffix in ["_log", "_mm"]:
+                self.log(f"val_mae{metric_suffix}", torch.tensor(100.0, device=self.device), prog_bar=True, on_epoch=True, sync_dist=True)
+                self.log(f"val_rmse{metric_suffix}", torch.tensor(100.0, device=self.device), prog_bar=True, on_epoch=True, sync_dist=True)
             return {"val_loss": fallback_loss}
         
-        # Compute masked validation loss
+        # Compute masked validation loss using transformed targets
         y_hat_masked = torch.where(mask, y_hat, torch.zeros_like(y_hat))
-        y_scaled_masked = torch.where(mask, y_scaled, torch.zeros_like(y_scaled))
+        y_transformed_masked = torch.where(mask, y_transformed, torch.zeros_like(y_transformed))
         
-        # Calculate element-wise loss
-        elementwise_loss = F.mse_loss(y_hat_masked, y_scaled_masked, reduction='none')
+        # Calculate element-wise loss based on loss type
+        if self.loss_type == 'mae':
+            elementwise_loss = F.l1_loss(y_hat_masked, y_transformed_masked, reduction='none')
+        else:
+            # For MSE and MSE-based losses
+            elementwise_loss = F.mse_loss(y_hat_masked, y_transformed_masked, reduction='none')
         
         # Apply regional weighting conditionally (same as in training_step)
         if self.hparams.use_regional_focus:
-            if hasattr(self.model, 'germany_mask') and self.model.germany_mask is not None:
-                weight_mask = self.model.germany_mask.to(elementwise_loss.device)
+            if hasattr(self.model, 'spatial_weight_mask') and self.model.spatial_weight_mask is not None:
+                weight_mask = self.model.spatial_weight_mask.to(elementwise_loss.device)
                 weighted_loss_elements = elementwise_loss * weight_mask
                 val_loss = torch.sum(weighted_loss_elements[mask]) / mask.sum().clamp(min=1)
             else:
@@ -244,49 +287,77 @@ class UNetLightningModule(L.LightningModule):
         self.log("val_loss", val_loss, prog_bar=True, on_epoch=True, sync_dist=True)
         
         with torch.no_grad():
-            # Calculate metrics only for Germany region
+            # Calculate metrics for Germany region in BOTH scales
             if mask.sum() > 0 and self.hparams.use_regional_focus and hasattr(self.model, 'germany_mask'):
                 # Get the Germany mask
-                weight_mask = self.model.germany_mask.to(mask.device)
-                # Get the region_weight value - this will be the exact weight assigned to Germany
-                region_weight = self.hparams.region_weight if hasattr(self.hparams, 'region_weight') else 1.0
-                # Germany is defined as areas with weight equal to region_weight
-                germany_region = (weight_mask == region_weight).to(mask.device)
+                germany_mask = self.model.germany_mask.to(mask.device)
                 
                 # Combine with the valid data mask (non-NaN values)
-                germany_valid_mask = mask & germany_region.expand_as(mask)
+                germany_valid_mask = mask & germany_mask.expand_as(mask)
                 
                 if germany_valid_mask.sum() > 0:
-                    # Calculate metrics only for valid points in Germany
-                    germany_mae = torch.abs(y_hat_masked[germany_valid_mask] - y_scaled_masked[germany_valid_mask]).mean()
-                    germany_mse = ((y_hat_masked[germany_valid_mask] - y_scaled_masked[germany_valid_mask]) ** 2).mean()
-                    germany_rmse = torch.sqrt(germany_mse)
+                    # Calculate LOG SCALE metrics (consistent with loss)
+                    germany_mae_log = torch.abs(y_hat_masked[germany_valid_mask] - y_transformed_masked[germany_valid_mask]).mean()
+                    germany_mse_log = ((y_hat_masked[germany_valid_mask] - y_transformed_masked[germany_valid_mask]) ** 2).mean()
+                    germany_rmse_log = torch.sqrt(germany_mse_log)
                     
-                    self.log("val_mae", germany_mae, prog_bar=True, on_epoch=True, sync_dist=True)
-                    self.log("val_rmse", germany_rmse, prog_bar=True, on_epoch=True, sync_dist=True)
+                    self.log("val_mae_log", germany_mae_log, prog_bar=True, on_epoch=True, sync_dist=True)
+                    self.log("val_rmse_log", germany_rmse_log, prog_bar=True, on_epoch=True, sync_dist=True)
+                    
+                    # Calculate ORIGINAL SCALE metrics (for real-world interpretation)
+                    if self.target_scaler is not None:
+                        y_hat_orig = self.target_scaler.inverse_transform(y_hat_masked[germany_valid_mask])
+                    else:
+                        y_hat_orig = y_hat_masked[germany_valid_mask]
+                    
+                    y_original_masked = y_original[germany_valid_mask]
+                    germany_mae_mm = torch.abs(y_hat_orig - y_original_masked).mean()
+                    germany_mse_mm = ((y_hat_orig - y_original_masked) ** 2).mean()
+                    germany_rmse_mm = torch.sqrt(germany_mse_mm)
+                    
+                    self.log("val_mae_mm", germany_mae_mm, prog_bar=True, on_epoch=True, sync_dist=True)
+                    self.log("val_rmse_mm", germany_rmse_mm, prog_bar=True, on_epoch=True, sync_dist=True)
+                    
                 else:
                     # If no valid points in Germany, log zero metrics
-                    self.log("val_mae", torch.tensor(0.0, device=self.device), prog_bar=True, on_epoch=True, sync_dist=True)
-                    self.log("val_rmse", torch.tensor(0.0, device=self.device), prog_bar=True, on_epoch=True, sync_dist=True)
+                    for metric_suffix in ["_log", "_mm"]:
+                        self.log(f"val_mae{metric_suffix}", torch.tensor(0.0, device=self.device), prog_bar=True, on_epoch=True, sync_dist=True)
+                        self.log(f"val_rmse{metric_suffix}", torch.tensor(0.0, device=self.device), prog_bar=True, on_epoch=True, sync_dist=True)
             else:
                 # Fallback to calculating metrics on all valid points if Germany mask is unavailable
-                val_mae = self.mae_metric(y_hat_masked[mask], y_scaled_masked[mask])
-                mse = self.rmse_metric(y_hat_masked[mask], y_scaled_masked[mask])
-                val_rmse = torch.sqrt(mse)
-                self.log("val_mae", val_mae, prog_bar=True, on_epoch=True, sync_dist=True)
-                self.log("val_rmse", val_rmse, prog_bar=True, on_epoch=True, sync_dist=True)
+                # LOG SCALE metrics
+                val_mae_log = self.mae_metric(y_hat_masked[mask], y_transformed_masked[mask])
+                mse_log = self.rmse_metric(y_hat_masked[mask], y_transformed_masked[mask])
+                val_rmse_log = torch.sqrt(mse_log)
+                self.log("val_mae_log", val_mae_log, prog_bar=True, on_epoch=True, sync_dist=True)
+                self.log("val_rmse_log", val_rmse_log, prog_bar=True, on_epoch=True, sync_dist=True)
+                
+                # ORIGINAL SCALE metrics
+                if self.target_scaler is not None:
+                    y_hat_orig_all = self.target_scaler.inverse_transform(y_hat_masked[mask])
+                else:
+                    y_hat_orig_all = y_hat_masked[mask]
+                
+                val_mae_mm = torch.abs(y_hat_orig_all - y_original[mask]).mean()
+                mse_mm = ((y_hat_orig_all - y_original[mask]) ** 2).mean()
+                val_rmse_mm = torch.sqrt(mse_mm)
+                self.log("val_mae_mm", val_mae_mm, prog_bar=True, on_epoch=True, sync_dist=True)
+                self.log("val_rmse_mm", val_rmse_mm, prog_bar=True, on_epoch=True, sync_dist=True)
             
-            # Apply inverse transform to get predictions back to original scale
-            y_hat_rescaled = self.target_scaler.inverse_transform(y_hat.detach())
+            # Apply inverse transform to get predictions back to original scale for saving
+            if self.target_scaler is not None:
+                y_hat_rescaled = self.target_scaler.inverse_transform(y_hat.detach())
+            else:
+                y_hat_rescaled = y_hat.detach()
         
         val_loss = val_loss.detach()
         
-        # Store predictions and targets for CRPS postprocessing later
+        # Store predictions and targets for CRPS postprocessing later (always in original scale)
         self.validation_step_preds.append(y_hat_rescaled)
         self.validation_step_targets.append(y_original.detach())
         
         # Help garbage collection
-        del y_hat, y_hat_masked, y_scaled_masked, mask
+        del y_hat, y_hat_masked, y_transformed_masked, mask
         
         return {"val_loss": val_loss}
     
@@ -320,13 +391,17 @@ class UNetLightningModule(L.LightningModule):
         y_hat_masked = torch.where(mask, y_hat, torch.zeros_like(y_hat))
         y_scaled_masked = torch.where(mask, y_scaled, torch.zeros_like(y_scaled))
         
-        # Calculate element-wise loss
-        elementwise_loss = F.mse_loss(y_hat_masked, y_scaled_masked, reduction='none')
+        # Calculate element-wise loss based on loss type
+        if self.loss_type == 'mae':
+            elementwise_loss = F.l1_loss(y_hat_masked, y_scaled_masked, reduction='none')
+        else:
+            # For MSE and MSE-based losses
+            elementwise_loss = F.mse_loss(y_hat_masked, y_scaled_masked, reduction='none')
         
         # Apply regional weighting conditionally (same as in other steps)
         if self.hparams.use_regional_focus:
-            if hasattr(self.model, 'germany_mask') and self.model.germany_mask is not None:
-                weight_mask = self.model.germany_mask.to(elementwise_loss.device)
+            if hasattr(self.model, 'spatial_weight_mask') and self.model.spatial_weight_mask is not None:
+                weight_mask = self.model.spatial_weight_mask.to(elementwise_loss.device)
                 weighted_loss_elements = elementwise_loss * weight_mask
                 test_loss = torch.sum(weighted_loss_elements[mask]) / mask.sum().clamp(min=1)
             else:
@@ -341,15 +416,11 @@ class UNetLightningModule(L.LightningModule):
         with torch.no_grad():
             # Calculate metrics only for Germany region
             if mask.sum() > 0 and self.hparams.use_regional_focus and hasattr(self.model, 'germany_mask'):
-                # Get the Germany mask
-                weight_mask = self.model.germany_mask.to(mask.device)
-                # Get the region_weight value - this will be the exact weight assigned to Germany
-                region_weight = self.hparams.region_weight if hasattr(self.hparams, 'region_weight') else 1.0
-                # Germany is defined as areas with weight equal to region_weight
-                germany_region = (weight_mask == region_weight).to(mask.device)
+                # Get the Germany mask (boolean)
+                germany_mask = self.model.germany_mask.to(mask.device)
                 
                 # Combine with the valid data mask (non-NaN values)
-                germany_valid_mask = mask & germany_region.expand_as(mask)
+                germany_valid_mask = mask & germany_mask.expand_as(mask)
                 
                 if germany_valid_mask.sum() > 0:
                     # Calculate metrics only for valid points in Germany
@@ -396,26 +467,32 @@ class UNetLightningModule(L.LightningModule):
             self.sample_predictions = y_hat_rescaled.detach().cpu().numpy()
     
     def on_validation_epoch_end(self):
-        """
-        Collects validation predictions and targets, and tracks the best metrics.
-        EasyUQ/CRPS calculation is deferred.
-        """
-        # Access metrics logged during the validation epoch
-        current_val_loss = self.trainer.callback_metrics.get('val_loss')
-        current_val_mae = self.trainer.callback_metrics.get('val_mae')
-        current_val_rmse = self.trainer.callback_metrics.get('val_rmse')
-
-        # Check if val_loss improved
-        if current_val_loss is not None and current_val_loss < self.best_val_loss:
-            self.best_val_loss = current_val_loss # Update best loss tracked internally
-            # Store the corresponding MAE and RMSE from this best epoch
-            self.best_val_mae = current_val_mae
-            self.best_val_rmse = current_val_rmse
-            print(f"\n[Module Best Metrics] New best val_loss: {self.best_val_loss:.4f} -> val_mae: {self.best_val_mae:.4f}, val_rmse: {self.best_val_rmse:.4f}\n")
+        """Track best validation metrics at the end of each validation epoch."""
+        # Get current validation metrics from logs
+        logs = self.trainer.callback_metrics
+        current_val_loss = logs.get("val_loss", float('inf'))
+        
+        # Track metrics in both scales
+        current_val_mae_log = logs.get("val_mae_log", float('inf'))
+        current_val_rmse_log = logs.get("val_rmse_log", float('inf'))
+        current_val_mae_mm = logs.get("val_mae_mm", float('inf'))
+        current_val_rmse_mm = logs.get("val_rmse_mm", float('inf'))
+        
+        # Update best metrics when validation loss improves
+        if current_val_loss < self.best_val_loss:
+            self.best_val_loss = current_val_loss
+            # Store the corresponding metrics from this best epoch (both scales)
+            self.best_val_mae_log = current_val_mae_log
+            self.best_val_rmse_log = current_val_rmse_log
+            self.best_val_mae_mm = current_val_mae_mm
+            self.best_val_rmse_mm = current_val_rmse_mm
+            
+            print(f"\n[Module Best Metrics] New best val_loss: {self.best_val_loss:.4f}")
+            print(f"  -> Log scale: MAE={self.best_val_mae_log:.4f}, RMSE={self.best_val_rmse_log:.4f}")
+            print(f"  -> Original scale (mm): MAE={self.best_val_mae_mm:.4f}, RMSE={self.best_val_rmse_mm:.4f}\n")
 
         # Predictions and targets are already collected in validation_step
-        # These will be accessed and saved in the main training script.
-        pass
+        # No need to process them here again
 
     # Add this method to clear lists at the start of each validation epoch
     def on_validation_epoch_start(self):
@@ -427,7 +504,7 @@ class UNetLightningModule(L.LightningModule):
         print("Cleared validation_step_preds and validation_step_targets for new epoch.") # Optional: for confirmation
 
     def configure_optimizers(self):
-        """Configure optimizers with learning rate scheduling and regularization."""
+        """Configure optimizers with learning rate scheduling optimized for double descent."""
         weight_decay = self.hparams.weight_decay if hasattr(self.hparams, 'weight_decay') else 1e-3
         
         if self.hparams.optimizer_type.lower() == "adamw":
@@ -445,41 +522,77 @@ class UNetLightningModule(L.LightningModule):
         else:
             raise ValueError(f"Unknown optimizer type: {self.hparams.optimizer_type}")
         
+        # Get max epochs for scheduler configuration
+        max_epochs = 200  # Default for double descent
+        if hasattr(self.trainer, 'max_epochs') and self.trainer.max_epochs:
+            max_epochs = self.trainer.max_epochs
+        elif hasattr(self.hparams, 'max_epochs') and self.hparams.max_epochs:
+            max_epochs = self.hparams.max_epochs
+        
         if self.hparams.lr_scheduler_type.lower() == "cosineannealingwarmrestarts":
+            # Optimized for double descent: fewer, longer cycles
             scheduler = {
                 'scheduler': torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                     optimizer, 
-                    T_0=10,  # Restart every 10 epochs
-                    T_mult=1, 
-                    eta_min=1e-6
+                    T_0=50,  # Longer initial cycle (50 epochs) for double descent
+                    T_mult=2,  # Double the cycle length each restart
+                    eta_min=1e-7  # Lower minimum for better exploration
                 ),
                 'interval': 'epoch',
                 'frequency': 1,
-                'name': 'cosine_lr'
+                'name': 'cosine_warmrestart_dd'
             }
         elif self.hparams.lr_scheduler_type.lower() == "reducelronplateau":
+            # Very conservative for double descent - avoid premature LR reduction
             scheduler = {
                 'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer,
                     mode='min',
-                    factor=0.5,  # Multiply LR by this factor when plateauing
-                    patience=5,   # Number of epochs with no improvement after which LR will be reduced
-                    min_lr=1e-6,  # Lower bound on the learning rate
+                    factor=0.7,  # Less aggressive reduction for double descent
+                    patience=50,   # Very high patience for double descent (was 30)
+                    min_lr=1e-7,  # Lower minimum for continued learning
+                    threshold=1e-4,  # More stringent improvement threshold
                     verbose=True
                 ),
-                'monitor': 'val_loss',  # Metric to monitor
+                'monitor': 'val_loss',
                 'interval': 'epoch',
                 'frequency': 1,
-                'name': 'plateau_lr'
+                'name': 'plateau_dd'
             }
         elif self.hparams.lr_scheduler_type.lower() == "cosineannealinglr":
+            # Standard cosine annealing optimized for double descent
             scheduler_instance = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=self.trainer.max_epochs if hasattr(self.trainer, 'max_epochs') else 
-                       (self.hparams.max_epochs if hasattr(self.hparams, 'max_epochs') else 10),
-                eta_min=1e-6
+                T_max=max_epochs,
+                eta_min=1e-7  # Lower minimum for better late-stage learning
             )
-            scheduler = {"scheduler": scheduler_instance, "interval": "epoch"}
+            scheduler = {"scheduler": scheduler_instance, "interval": "epoch", "name": "cosine_dd"}
+        elif self.hparams.lr_scheduler_type.lower() == "doubledescent":
+            # Custom scheduler designed specifically for double descent
+            def double_descent_lambda(epoch):
+                """
+                Custom learning rate schedule for double descent:
+                - Phase 1 (0-60): Gradual decay to encourage first descent
+                - Phase 2 (60-120): Maintain moderate LR through overfitting valley
+                - Phase 3 (120-200): Gradual decay to enable second descent
+                """
+                if epoch < 60:
+                    # First descent phase: moderate decay
+                    return 0.5 * (1 + torch.cos(torch.tensor(epoch / 60 * 3.14159))).item()
+                elif epoch < 120:
+                    # Overfitting valley: maintain higher LR for exploration
+                    return 0.3 + 0.2 * (1 + torch.cos(torch.tensor((epoch - 60) / 60 * 3.14159))).item()
+                else:
+                    # Second descent phase: gentle decay
+                    progress = (epoch - 120) / 80
+                    return 0.3 * (1 + torch.cos(torch.tensor(progress * 3.14159))).item()
+            
+            scheduler_instance = torch.optim.lr_scheduler.LambdaLR(optimizer, double_descent_lambda)
+            scheduler = {"scheduler": scheduler_instance, "interval": "epoch", "name": "double_descent"}
+        elif self.hparams.lr_scheduler_type.lower() == "constant":
+            # Constant learning rate - sometimes optimal for double descent
+            scheduler = {"scheduler": torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0), 
+                        "interval": "epoch", "name": "constant"}
         else:
             raise ValueError(f"Unknown lr scheduler type: {self.hparams.lr_scheduler_type}")
         
@@ -490,7 +603,7 @@ class UNetLightningModule(L.LightningModule):
         Configure the loss function for precipitation forecasting.
         
         Args:
-            loss_type: Type of loss function ('mse', 'weighted_mse', 'huber', 'focal_mse', 'asymmetric_mse')
+            loss_type: Type of loss function ('mse', 'mae', 'weighted_mse', 'huber', 'focal_mse', 'asymmetric_mse')
             intensity_weights: Optional weights for different precipitation intensities
             focal_gamma: Gamma parameter for focal loss (higher = more focus on hard examples)
             
@@ -501,6 +614,14 @@ class UNetLightningModule(L.LightningModule):
         
         def mse_loss(pred, target):
             return F.mse_loss(pred, target)
+        
+        def mae_loss(pred, target):
+            """
+            Mean Absolute Error loss.
+            MAE is computed in log space (same as MSE) when log transform is enabled.
+            This provides a more balanced treatment of relative errors across precipitation ranges.
+            """
+            return F.l1_loss(pred, target)
         
         def weighted_mse_loss(pred, target):
             # Create masks for different precipitation intensities
@@ -575,6 +696,8 @@ class UNetLightningModule(L.LightningModule):
         # Assign the selected loss function
         if loss_type == 'mse':
             loss_fn = mse_loss
+        elif loss_type == 'mae':
+            loss_fn = mae_loss
         elif loss_type == 'weighted_mse':
             loss_fn = weighted_mse_loss
         elif loss_type == 'huber':

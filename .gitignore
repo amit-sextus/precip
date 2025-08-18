@@ -1,32 +1,43 @@
-# Data files
-# Ignore everything IN the data directory first
-data/*
+# Documentation files
+*.md
+*.tex
+*.png
 
-# BUT, do NOT ignore the data module script itself
-!data/mswep_data_module_2.py
-# And don't ignore the directory itself, so the file above can be tracked
-!data/
+# Data directories and files
+data/
+precip_data/
+precip_data - Copy/
+ERA5/data/
+ERA5/README.md
+ERA5/data_inventory.md
+ERA5/targetgrid_germany.txt
 
-# Third-party packages
-isodisreg/
-
-# Log directories
-hyperparam_search_logs/
+# Output directories
+test_output/
+test_single_level_output/
 logs/
 
-# Results and output directories
-hyperparam_search_results/
-
-# Python cache files
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
 
-# Environment files (optional, add if needed)
-# .env
-# environment.yml
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# OS-specific files
+# OS files
 .DS_Store
+Thumbs.db
 
-# Editor/IDE specific files
-.vscode/ 
+# External libraries (already available on GitHub)
+isodisreg/
+
+# Temporary files
+*.tmp
+*.temp

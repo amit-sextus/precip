@@ -1,90 +1,196 @@
 import numpy as np
 import xarray as xr
 import pandas as pd
-from cdo import Cdo
 import os
-import subprocess
 
-# Initialize CDO
-cdo = Cdo()
+# Initialize CDO with explicit path to avoid initialization issues
+try:
+    from cdo import Cdo
+    # Try to initialize CDO with explicit path to the system executable
+    cdo = Cdo(cdo='/usr/bin/cdo')
+    print("CDO initialized successfully with explicit path.")
+except Exception as e:
+    print(f"Error initializing CDO: {e}")
+    print("Falling back to xarray-based regridding methods.")
+    cdo = None
 
 def regrid_bilinear(input_file, output_file, target_grid_file):
     """Regrids using bilinear interpolation."""
+    # Add file existence check
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(f"Input file not found for regridding: {input_file}")
+    
+    # Try opening with xarray to catch HDF errors early
     try:
-        cdo.remapbil(target_grid_file, input=input_file, output=output_file, options='-P 8') # Use 8 parallel processes if helpful
+        test_ds = xr.open_dataset(input_file)
+        test_ds.close()
+    except Exception as e:
+        raise RuntimeError(f"Cannot open {input_file} as NetCDF: {e}")
+    
+    # Check if this is a pressure level file
+    is_pressure_level = 'pl_' in os.path.basename(input_file)
+    
+    if cdo is None or is_pressure_level:
+        if is_pressure_level:
+            print("Using xarray-based regridding for pressure level file")
+        else:
+            print("CDO not available, using xarray-based regridding")
+        _regrid_xarray(input_file, output_file, target_grid_file, method='bilinear')
+        return
+        
+    try:
+        cdo.remapbil(target_grid_file, input=input_file, output=output_file, options='-P 8')
         print(f"Bilinear regridding successful: {output_file}")
     except Exception as e:
         print(f"ERROR during bilinear regridding for {input_file}: {e}")
+        print("Falling back to xarray-based regridding")
+        _regrid_xarray(input_file, output_file, target_grid_file, method='bilinear')
 
 
 def con_grid(input_file, output_file, target_grid_file):
     """Regrids using conservative remapping."""
+    # Add file existence check
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(f"Input file not found for regridding: {input_file}")
+    
+    # Try opening with xarray to catch HDF errors early
+    try:
+        test_ds = xr.open_dataset(input_file)
+        test_ds.close()
+    except Exception as e:
+        raise RuntimeError(f"Cannot open {input_file} as NetCDF: {e}")
+    
+    # Check if this is a pressure level file
+    is_pressure_level = 'pl_' in os.path.basename(input_file)
+    
+    if cdo is None or is_pressure_level:
+        if is_pressure_level:
+            print("Using xarray-based regridding for pressure level file")
+        else:
+            print("CDO not available, using xarray-based regridding")
+        _regrid_xarray(input_file, output_file, target_grid_file, method='conservative')
+        return
+        
     try:
         cdo.remapcon(target_grid_file, input=input_file, output=output_file, options='-P 8')
         print(f"Conservative regridding successful: {output_file}")
     except Exception as e:
         print(f"ERROR during conservative regridding for {input_file}: {e}")
+        print("Falling back to xarray-based regridding")
+        _regrid_xarray(input_file, output_file, target_grid_file, method='conservative')
 
-def get_shear(u925_regridded_file, v925_regridded_file, u600_regridded_file, v600_regridded_file):
-    """Calculates wind shear between 925 hPa and 600 hPa from regridded files."""
+
+def _regrid_xarray(input_file, output_file, target_grid_file, method='bilinear'):
+    """Fallback regridding using xarray and scipy interpolation."""
     try:
-        u925_ds = xr.open_dataset(u925_regridded_file)
-        if 'valid_time' in u925_ds.dims: u925_ds = u925_ds.rename({'valid_time': 'time'})
-        if 'valid_time' in u925_ds.coords: u925_ds = u925_ds.rename({'valid_time': 'time'})
-        v925_ds = xr.open_dataset(v925_regridded_file)
-        if 'valid_time' in v925_ds.dims: v925_ds = v925_ds.rename({'valid_time': 'time'})
-        if 'valid_time' in v925_ds.coords: v925_ds = v925_ds.rename({'valid_time': 'time'})
-        u600_ds = xr.open_dataset(u600_regridded_file)
-        if 'valid_time' in u600_ds.dims: u600_ds = u600_ds.rename({'valid_time': 'time'})
-        if 'valid_time' in u600_ds.coords: u600_ds = u600_ds.rename({'valid_time': 'time'})
-        v600_ds = xr.open_dataset(v600_regridded_file)
-        if 'valid_time' in v600_ds.dims: v600_ds = v600_ds.rename({'valid_time': 'time'})
-        if 'valid_time' in v600_ds.coords: v600_ds = v600_ds.rename({'valid_time': 'time'})
-
-        # Select the variable (ensure names match ERA5 download: 'u', 'v')
-        u925 = u925_ds['u'].squeeze()
-        v925 = v925_ds['v'].squeeze()
-        u600 = u600_ds['u'].squeeze()
-        v600 = v600_ds['v'].squeeze()
-
-        # Ensure time coordinates match before calculation
-        u600, v600 = xr.align(u600, v600, join='inner')
-        u925, v925 = xr.align(u925, v925, join='inner')
-        u925, u600 = xr.align(u925, u600, join='inner')
-        v925, v600 = xr.align(v925, v600, join='inner')
-
-        z_diff_hpa = 925 - 600 # Difference in hPa
-
-        # Approximate height difference (using standard atmosphere, very rough estimate)
-        # A better approach might use geopotential height difference if available
-        # Standard atmosphere approx: dz/dp = -RT/gp => dz ~ -(RT/gp) * dp
-        # Assume T ~ 273K, R=287, g=9.81, p_mid ~ 762 hPa = 76200 Pa
-        # dz ~ -(287*273 / (9.81*76200)) * (60000-92500) Pa ~ 3400 m
-        # For simplicity, using pressure difference directly might be acceptable
-        # if used as a relative index, but it's not physically shear (unit: m/s / m).
-        # Let's stick to pressure difference denominator for consistency with original logic
-   
-        z = z_diff_hpa
-
-        diff_u = u925 - u600
-        diff_v = v925 - v600
-        diff_u2 = diff_u ** 2
-        diff_v2 = diff_v ** 2
-        diff_mag = (diff_u2 + diff_v2)**(0.5)
-        shear = diff_mag / z # Units: m/s / hPa
-
-        # Create a new DataArray for shear
-        shear_da = xr.DataArray(
-            data=shear.values,
-            dims=u925.dims,
-            coords=u925.coords,
-            name="shear925_600"
-        )
-        print("Shear calculation successful.")
-        return shear_da
+        import scipy.interpolate
+        
+        # Read input data
+        ds = xr.open_dataset(input_file)
+        
+        # Read target grid
+        target_grid = _read_target_grid(target_grid_file)
+        
+        # Perform interpolation for each variable
+        regridded_vars = {}
+        for var_name in ds.data_vars:
+            var = ds[var_name]
+            
+            # Get coordinates
+            if 'longitude' in var.dims:
+                lon_dim = 'longitude'
+            elif 'lon' in var.dims:
+                lon_dim = 'lon'
+            else:
+                raise ValueError(f"No longitude coordinate found in {var_name}")
+                
+            if 'latitude' in var.dims:
+                lat_dim = 'latitude'
+            elif 'lat' in var.dims:
+                lat_dim = 'lat'
+            else:
+                raise ValueError(f"No latitude coordinate found in {var_name}")
+            
+            # Interpolate variable
+            regridded_var = var.interp(
+                {lon_dim: target_grid['lon'], lat_dim: target_grid['lat']},
+                method='linear' if method == 'bilinear' else 'nearest'
+            )
+            
+            # Rename coordinates to standard names
+            if lon_dim != 'lon':
+                regridded_var = regridded_var.rename({lon_dim: 'lon'})
+            if lat_dim != 'lat':
+                regridded_var = regridded_var.rename({lat_dim: 'lat'})
+                
+            regridded_vars[var_name] = regridded_var
+        
+        # Create new dataset
+        regridded_ds = xr.Dataset(regridded_vars)
+        
+        # Copy attributes
+        regridded_ds.attrs = ds.attrs
+        for var_name in regridded_vars:
+            regridded_ds[var_name].attrs = ds[var_name].attrs
+        
+        # Save to file
+        regridded_ds.to_netcdf(output_file)
+        print(f"Xarray regridding successful: {output_file}")
+        
+        # Close datasets
+        ds.close()
+        regridded_ds.close()
+        
     except Exception as e:
-        print(f"ERROR calculating shear: {e}")
-        return None
+        print(f"ERROR during xarray regridding for {input_file}: {e}")
+        raise
+
+
+def _read_target_grid(target_grid_file):
+    """Read target grid file and return lon/lat arrays."""
+    try:
+        # Try to read as a simple text file with grid description
+        with open(target_grid_file, 'r') as f:
+            lines = f.readlines()
+        
+        # Parse grid description (assuming CDO grid format)
+        grid_info = {}
+        for line in lines:
+            line = line.strip()
+            if line.startswith('xsize'):
+                grid_info['nlon'] = int(line.split('=')[1])
+            elif line.startswith('ysize'):
+                grid_info['nlat'] = int(line.split('=')[1])
+            elif line.startswith('xfirst'):
+                grid_info['lon_first'] = float(line.split('=')[1])
+            elif line.startswith('yfirst'):
+                grid_info['lat_first'] = float(line.split('=')[1])
+            elif line.startswith('xinc'):
+                grid_info['lon_inc'] = float(line.split('=')[1])
+            elif line.startswith('yinc'):
+                grid_info['lat_inc'] = float(line.split('=')[1])
+        
+        # Generate coordinate arrays
+        lons = np.linspace(
+            grid_info['lon_first'],
+            grid_info['lon_first'] + (grid_info['nlon'] - 1) * grid_info['lon_inc'],
+            grid_info['nlon']
+        )
+        lats = np.linspace(
+            grid_info['lat_first'],
+            grid_info['lat_first'] + (grid_info['nlat'] - 1) * grid_info['lat_inc'],
+            grid_info['nlat']
+        )
+        
+        return {'lon': lons, 'lat': lats}
+        
+    except Exception as e:
+        print(f"Error reading target grid file {target_grid_file}: {e}")
+        # Fallback to a default Germany grid
+        print("Using default Germany grid")
+        lons = np.arange(5.0, 16.0, 0.25)  # 5°E to 15°E, 0.25° resolution
+        lats = np.arange(47.0, 56.0, 0.25)  # 47°N to 55°N, 0.25° resolution
+        return {'lon': lons, 'lat': lats}
 
 
 def get_pressure_tendency(sp_regridded_file):
@@ -104,7 +210,7 @@ def get_pressure_tendency(sp_regridded_file):
         # The difference is assigned to the later timestamp. First time step is lost.
         pressure_tendency_da = pressure_tendency_da.rename('pressure_tendency')
 
-        # Keep as Pa/24h assuming daily (00Z) input
+        # Keep as Pa/24h assuming daily (18:00 UTC) input
         print("Pressure tendency calculation successful.")
         return pressure_tendency_da
     except Exception as e:
@@ -112,163 +218,39 @@ def get_pressure_tendency(sp_regridded_file):
         return None
 
 
-def get_stream(vo700_regridded_file, temp_dir_base, target_grid_file):
-    """Calculates stream function using CDO from regridded vorticity 700hPa file.
-
-    Args:
-        vo700_regridded_file: Path to the regridded vorticity file.
-        temp_dir_base: Path to the base directory where temporary files will be created.
-        target_grid_file: Path to the target grid definition file.
-    """
-    print("Calculating stream function...")
-    original_cwd = os.path.abspath(os.getcwd())
-
-    vo_in_abs = os.path.abspath(vo700_regridded_file)
-    target_grid_file_abs = os.path.abspath(target_grid_file)
-    temp_dir_abs = os.path.abspath(temp_dir_base)
-
-    if not os.path.exists(vo_in_abs):
-         print(f"ERROR: Input vorticity file not found at {vo_in_abs}")
-         return None
-    if not os.path.exists(target_grid_file_abs):
-         print(f"ERROR: Target grid file not found at {target_grid_file_abs}")
-         return None
-    if not os.path.exists(temp_dir_abs):
-        print(f"ERROR: Base temporary directory not found at {temp_dir_abs}")
-        return None
-    if not os.path.isdir(temp_dir_abs):
-        print(f"ERROR: Provided temporary path is not a directory: {temp_dir_abs}")
-        return None
-
-    # Define intermediate filenames (these will be created within the temp_dir_abs)
-    vo_svo = os.path.join(temp_dir_abs, "era5_vorticity_700_svo.nc")
-    zero_div = os.path.join(temp_dir_abs, "era5_zerodiv.nc")
-    svosd = os.path.join(temp_dir_abs, "era5_svosd.nc")
-    stream_out = os.path.join(temp_dir_abs, "era5_stream_final.nc")
-    t511grid = "t511grid" # Intermediate grid for CDO processing steps
-
-    vo_filled_temp_file = os.path.join(temp_dir_abs, "era5_vorticity_700_filled.nc")
-    try:
-        with xr.open_dataset(vo_in_abs) as ds_vo:
-            vo_var_name = list(ds_vo.data_vars)[0]
-            ds_vo[vo_var_name] = ds_vo[vo_var_name].fillna(0.0) # Fill NaNs with 0
-            ds_vo.to_netcdf(vo_filled_temp_file)
-        print(f"Filled NaNs in vorticity, saved to {vo_filled_temp_file}")
-        input_for_cdo = vo_filled_temp_file
-    except Exception as e:
-        print(f"ERROR filling NaNs in vorticity file {vo_in_abs}: {e}")
-        os.chdir(original_cwd)
-        return None
-
-    # Define the CDO commands using absolute paths
-    commands = [
-        f"cdo -b 32 setname,svo {input_for_cdo} {vo_svo}",
-        f"cdo -L -b 32 chname,svo,sd -mulc,0 {vo_svo} {zero_div}",
-        f"cdo -merge {vo_svo} {zero_div} {svosd}",
-        f"cdo -L -b 32 remapbil,{target_grid_file_abs} -selvar,stream -sp2gp -dv2ps -gp2sp -remapbil,{t511grid} {svosd} {stream_out}"
-    ]
-
-    success = True
-    stream_da = None
-    try:
-        for cmd in commands:
-            print(f"Running command: {cmd}")
-            subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
-            print("Command completed successfully.")
-    except subprocess.CalledProcessError as e:
-        print(f"Error occurred while running command: {cmd}")
-        print(f"Stderr: {e.stderr}")
-        print(f"Stdout: {e.stdout}")
-        success = False
-    except FileNotFoundError as e:
-        print(f"Error: CDO command not found. Is CDO installed and in your PATH? Command: {cmd}")
-        print(e)
-        success = False
-    finally:
-        os.chdir(original_cwd)
-
-        result_path = stream_out
-
-        if success and os.path.exists(result_path):
-            print("Stream function calculation successful.")
-            try:
-                with xr.open_dataset(result_path) as data:
-                    if 'valid_time' in data.dims:
-                        data = data.rename({'valid_time': 'time'})
-                    if 'valid_time' in data.coords:
-                        data = data.rename({'valid_time': 'time'})
-
-                    if 'stream' in data:
-                         stream_da_temp = data['stream']
-                         if 'plev' in stream_da_temp.coords:
-                             stream_da_temp = stream_da_temp.drop_vars('plev', errors='ignore')
-                         if 'level' in stream_da_temp.coords:
-                             stream_da_temp = stream_da_temp.drop_vars('level', errors='ignore')
-                         stream_da = stream_da_temp.rename('stream700')
-                    else:
-                        print(f"ERROR: 'stream' variable not found in output file: {result_path}")
-                        success = False
-            except Exception as e:
-                print(f"Error opening or processing stream function result file {result_path}: {e}")
-                success = False
+def handle_expver(ds):
+    """Handles the 'expver' dimension in ERA5 data by prioritizing ERA5 over ERA5T."""
+    if 'expver' in ds.dims:
+        if ds.expver.size > 1:
+            # Prioritize ERA5 (expver=1) over ERA5T (expver=5)
+            ds = ds.sel(expver=1).combine_first(ds.sel(expver=5))
         else:
-             if not success:
-                 pass # Error already printed
-             else:
-                 print(f"Stream function calculation failed: Output file not found at {result_path}")
-                 success = False
-
-        print(f"Cleaning up temporary files in: {temp_dir_abs}")
-        for f in [vo_filled_temp_file, vo_svo, zero_div, svosd, stream_out]:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except OSError as e:
-                    print(f"Warning: Could not remove temp file {f}: {e}")
-        if os.path.exists(temp_dir_abs):
-            try:
-                os.rmdir(temp_dir_abs)
-            except OSError as e:
-                print(f"Warning: Could not remove temp directory {temp_dir_abs}: {e}. Check for leftover files.")
-
-    return stream_da
+            ds = ds.squeeze('expver', drop=True)
+    return ds
 
 
 # --- Variable Name Mapping ---
 def get_short_name(variable_key, level=None):
-    """Maps ERA5 variable names/keys (potentially including level) and levels to shorter names for filenames/use."""
+    """Maps ERA5 variable names/keys to shorter names for filenames/use."""
     mapping = {
         'total_column_water_vapour': 'tcwv',
-        'convective_available_potential_energy': 'cape',
-        'convective_inhibition': 'cin',
         '2m_temperature': 't2m',
-        '2m_dewpoint_temperature': 'd2m',
         'surface_pressure': 'sp',
         'mean_sea_level_pressure': 'msl',
         # Pressure level base names
-        'geopotential': 'z',
-        'temperature': 't',
         'specific_humidity': 'q',
-        'relative_humidity': 'r',
         'u_component_of_wind': 'u',
         'v_component_of_wind': 'v',
-        'vertical_velocity': 'w',
-        'vorticity': 'vo',
-        'divergence': 'd',
-        # Derived variables from this script (already unique)
-        # These should ideally be handled before calling this function if passed as keys,
-        # but we include them here for completeness or if the function is called directly.
-        'shear925_600': 'shear925_600',
+        # Derived variables
         'pressure_tendency': 'ptend',
-        'stream700': 'stream700',
     }
-    pressure_level_base_vars = ['z', 't', 'q', 'r', 'u', 'v', 'w', 'vo', 'd']
+    pressure_level_base_vars = ['q', 'u', 'v']
 
     base_era5_name = variable_key
     extracted_level = level
     parts = variable_key.split('_')
     # Heuristic check if the last part looks like a level number
-    if len(parts) > 1 and parts[-1].isdigit() and parts[-2] not in ['of', 'column', 'available', 'level', 'm']:
+    if len(parts) > 1 and parts[-1].isdigit() and parts[-2] not in ['of', 'column', 'level', 'm']:
         base_era5_name = '_'.join(parts[:-1])
         if extracted_level is None:
             extracted_level = int(parts[-1])
@@ -281,8 +263,8 @@ def get_short_name(variable_key, level=None):
         else:
             return base_short_name
     else:
-        # Fallback for unmapped or already-short names
-        if variable_key in ['shear925_600', 'pressure_tendency', 'stream700']:
+        # Fallback for unmapped names
+        if variable_key == 'pressure_tendency':
              return variable_key
-        print(f"Warning: No short name mapping found for base name '{base_era5_name}' derived from key '{variable_key}' (Level: {extracted_level}). Using original key format.")
+        print(f"Warning: No short name mapping found for '{base_era5_name}' (Level: {extracted_level}). Using original key.")
         return f"{variable_key}_{level}" if level else variable_key
