@@ -316,7 +316,7 @@ def compute_idr_crps_timeseries(idr_models_by_cell, det_preds_test, obs_test, ge
     Parameters
     ----------
     idr_models_by_cell : dict
-        Dictionary mapping (lat_idx, lon_idx) to fitted IDR prediction objects.
+        Dictionary mapping (lat_idx, lon_idx) to fitted IDR models.
         These must be pre-fitted on training data only.
     det_preds_test : np.ndarray
         Array [T, Ny, Nx] of deterministic predictions for test period.
@@ -339,40 +339,54 @@ def compute_idr_crps_timeseries(idr_models_by_cell, det_preds_test, obs_test, ge
     # Pre-compute area weights for Germany
     area_weights = coslat_weights(lat_2d, germany_mask)
     
+    # Pre-generate predictions and compute CRPS for all cells once
+    crps_by_cell = {}
+    for (i, j), idr_model in idr_models_by_cell.items():
+        if idr_model is None or not germany_mask[i, j]:
+            continue
+        try:
+            # Get all predictions for this cell
+            det_preds_cell = det_preds_test[:, i, j]
+            obs_cell = obs_test[:, i, j]
+            
+            # Skip if all data is NaN
+            if np.all(np.isnan(det_preds_cell)) or np.all(np.isnan(obs_cell)):
+                continue
+            
+            # Create predictions
+            preds_df = pd.DataFrame(det_preds_cell)
+            predicted_dist = idr_model.predict(preds_df)
+            
+            # Compute CRPS for all time points
+            crps_values = predicted_dist.crps(obs_cell)
+            if isinstance(crps_values, list):
+                crps_values = np.array(crps_values)
+            
+            crps_by_cell[(i, j)] = crps_values
+            
+        except Exception as e:
+            # Skip cells with errors
+            crps_by_cell[(i, j)] = None
+    
+    # Now compute daily averages
     for t in range(T):
         # Initialize CRPS map for this day
         crps_map = np.full((Ny, Nx), np.nan)
         
         for i in range(Ny):
             for j in range(Nx):
-                # Skip if not in Germany or no IDR model for this cell
-                if not germany_mask[i, j] or (i, j) not in idr_models_by_cell:
+                # Skip if not in Germany or no CRPS for this cell
+                if not germany_mask[i, j] or (i, j) not in crps_by_cell:
                     continue
                 
-                # Get IDR predictions for this cell
-                idr_pred = idr_models_by_cell[(i, j)]
-                if idr_pred is None:
+                crps_values = crps_by_cell[(i, j)]
+                if crps_values is None or len(crps_values) <= t:
                     continue
                 
-                try:
-                    # Get deterministic prediction for this time and cell
-                    det_pred_scalar = det_preds_test[t, i, j]
-                    obs_scalar = obs_test[t, i, j]
-                    
-                    # Skip if either is NaN
-                    if np.isnan(det_pred_scalar) or np.isnan(obs_scalar):
-                        continue
-                    
-                    # Compute CRPS using IDR's own method
-                    # Note: The exact API may vary, adjust if needed
-                    crps_value = idr_pred.crps(np.array([obs_scalar]))[0]
-                    
-                    if np.isfinite(crps_value):
-                        crps_map[i, j] = crps_value
-                        
-                except Exception as e:
-                    # Silently skip cells with errors
-                    pass
+                # Get CRPS for this time point
+                crps_value = crps_values[t]
+                if np.isfinite(crps_value):
+                    crps_map[i, j] = crps_value
         
         # Compute area-weighted mean for this day
         if np.any(np.isfinite(crps_map)):
@@ -390,7 +404,7 @@ def compute_brier_score_timeseries(idr_models_by_cell, det_preds_test, obs_test,
     Parameters
     ----------
     idr_models_by_cell : dict
-        Dictionary mapping (lat_idx, lon_idx) to fitted IDR prediction objects.
+        Dictionary mapping (lat_idx, lon_idx) to fitted IDR models.
     det_preds_test : np.ndarray
         Array [T, Ny, Nx] of deterministic predictions for test period.
     obs_test : np.ndarray
@@ -417,19 +431,47 @@ def compute_brier_score_timeseries(idr_models_by_cell, det_preds_test, obs_test,
     # Pre-compute area weights for Germany
     area_weights = coslat_weights(lat_2d, germany_mask)
     
+    # Pre-generate predictions and compute CDFs for all cells once
+    cdf_by_cell = {}
+    for (i, j), idr_model in idr_models_by_cell.items():
+        if idr_model is None or not germany_mask[i, j]:
+            continue
+        try:
+            # Get all predictions for this cell
+            det_preds_cell = det_preds_test[:, i, j]
+            
+            # Skip if all data is NaN
+            if np.all(np.isnan(det_preds_cell)):
+                continue
+            
+            # Create predictions
+            preds_df = pd.DataFrame(det_preds_cell)
+            predicted_dist = idr_model.predict(preds_df)
+            
+            # Compute CDF at threshold for all time points
+            cdf_values = predicted_dist.cdf(thresholds=np.array([threshold]))
+            if cdf_values.ndim == 2:
+                cdf_values = cdf_values[:, 0]  # Extract first column if 2D
+            
+            cdf_by_cell[(i, j)] = cdf_values
+            
+        except Exception as e:
+            # Skip cells with errors
+            cdf_by_cell[(i, j)] = None
+    
+    # Now compute daily Brier Scores
     for t in range(T):
         # Initialize BS map for this day
         bs_map = np.full((Ny, Nx), np.nan)
         
         for i in range(Ny):
             for j in range(Nx):
-                # Skip if not in Germany or no IDR model for this cell
-                if not germany_mask[i, j] or (i, j) not in idr_models_by_cell:
+                # Skip if not in Germany or no CDF for this cell
+                if not germany_mask[i, j] or (i, j) not in cdf_by_cell:
                     continue
                 
-                # Get IDR predictions for this cell
-                idr_pred = idr_models_by_cell[(i, j)]
-                if idr_pred is None:
+                cdf_values = cdf_by_cell[(i, j)]
+                if cdf_values is None or len(cdf_values) <= t:
                     continue
                 
                 try:
@@ -438,11 +480,10 @@ def compute_brier_score_timeseries(idr_models_by_cell, det_preds_test, obs_test,
                     if np.isnan(obs_scalar):
                         continue
                     
-                    # Compute PoP = 1 - F(threshold) using IDR's CDF
-                    prob_le_threshold = idr_pred.cdf(thresholds=np.array([threshold]))[0]
-                    if isinstance(prob_le_threshold, np.ndarray):
-                        prob_le_threshold = prob_le_threshold[0]
+                    # Get CDF value at threshold for this time
+                    prob_le_threshold = cdf_values[t]
                     
+                    # Compute PoP = 1 - F(threshold)
                     pop = 1.0 - prob_le_threshold
                     pop = np.clip(pop, 0.0, 1.0)
                     
