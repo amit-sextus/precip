@@ -1,0 +1,78 @@
+# Example evaluation manifest for MSWEP precipitation forecasting runs
+# This demonstrates the two main experimental groups:
+# A. Regional weighting sweep (outside_weight variations)
+# B. ERA5 feature groups comparison
+
+runs:
+  # Group A: Regional weighting sweep (rainfall+seasonality only)
+  - run_id: "run_regional_weight_0.2"
+    path: "/path/to/runs/regional_weight_0.2/fold9"  # PLACEHOLDER - replace with actual path
+    outside_weight: 0.2
+    era5_group: "none"
+    note: "Regional weighting sweep - low outside weight"
+    
+  - run_id: "run_regional_weight_0.5"
+    path: "/path/to/runs/regional_weight_0.5/fold9"  # PLACEHOLDER - replace with actual path
+    outside_weight: 0.5
+    era5_group: "none"
+    note: "Regional weighting sweep - medium outside weight"
+    
+  - run_id: "run_regional_weight_0.7"
+    path: "/path/to/runs/regional_weight_0.7/fold9"  # PLACEHOLDER - replace with actual path
+    outside_weight: 0.7
+    era5_group: "none"
+    note: "Regional weighting sweep - high outside weight"
+  
+  # Optional additional points for finer sweep
+  - run_id: "run_regional_weight_0.3"
+    path: "/path/to/runs/regional_weight_0.3/fold9"  # PLACEHOLDER - replace with actual path
+    outside_weight: 0.3
+    era5_group: "none"
+    note: "Regional weighting sweep - additional point"
+    
+  - run_id: "run_regional_weight_0.4"
+    path: "/path/to/runs/regional_weight_0.4/fold9"  # PLACEHOLDER - replace with actual path
+    outside_weight: 0.4
+    era5_group: "none"
+    note: "Regional weighting sweep - additional point"
+    
+  - run_id: "run_regional_weight_0.6"
+    path: "/path/to/runs/regional_weight_0.6/fold9"  # PLACEHOLDER - replace with actual path
+    outside_weight: 0.6
+    era5_group: "none"
+    note: "Regional weighting sweep - additional point"
+  
+  # Group B: ERA5 feature groups (at best outside_weight - assumed 0.5 here)
+  - run_id: "run_era5_none_best"
+    path: "/path/to/runs/era5_none_best/fold9"  # PLACEHOLDER - replace with actual path
+    outside_weight: 0.5  # Use the best value from Group A
+    era5_group: "none"
+    note: "ERA5 comparison - rainfall and seasonality only"
+    
+  - run_id: "run_era5_wind_only_best"
+    path: "/path/to/runs/era5_wind_only_best/fold9"  # PLACEHOLDER - replace with actual path
+    outside_weight: 0.5  # Use the best value from Group A
+    era5_group: "wind_only"
+    note: "ERA5 comparison - wind only (u,v at 300/500/700/850 hPa, all temporal lags)"
+    # wind_only configuration:
+    # - Variables: u, v (zonal and meridional wind components)
+    # - Levels: 300, 500, 700, 850 hPa
+    # - Temporal lags: Standard project lags (typically t-1, t-2, t-3 days)
+    
+  - run_id: "run_era5_all_best"
+    path: "/path/to/runs/era5_all_best/fold9"  # PLACEHOLDER - replace with actual path
+    outside_weight: 0.5  # Use the best value from Group A
+    era5_group: "all"
+    note: "ERA5 comparison - comprehensive configuration"
+    # all configuration includes:
+    # - Wind: u, v at 300/500/700/850 hPa
+    # - Humidity: q (specific humidity) at 300/500/700/850 hPa
+    # - Surface: MSLP (mean sea level pressure), T2M (2m temperature), TCWV (total column water vapor)
+    # - Derived: pressure tendency (dp/dt)
+    # - All with standard temporal lags
+
+# Notes:
+# 1. Replace all PLACEHOLDER paths with actual run directories
+# 2. Adjust outside_weight for Group B based on best result from Group A
+# 3. Each run should have completed evaluation data (val_preds.npy, val_targets.npy, etc.)
+# 4. The fold number (e.g., fold9) should match your cross-validation setup

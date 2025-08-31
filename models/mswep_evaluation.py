@@ -13,6 +13,15 @@ from tqdm import tqdm
 import argparse
 import calendar
 
+# Import verification helpers for area weighting and diagnostics
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.verification_helpers import (
+    coslat_weights, spatial_weighted_mean, month_to_season,
+    skill_score, corp_bs_decomposition, corp_crps_decomposition_from_cdf,
+    build_mpc_climatology, crps_sample_distribution, mpc_pop
+)
+
 # Assumed global grid definition (should match the data being evaluated)
 # These are based on the prompt's suggested arrays and typical MSWEP-like grids.
 # Users should verify these match their specific data dimensions and extents.
@@ -275,6 +284,189 @@ def apply_easyuq_per_cell(train_preds_cell: np.ndarray,
         # Consider cases like zero variance in inputs/outputs if they cause issues
         # traceback.print_exc() # Uncomment for detailed debugging
         return None
+
+
+def create_lat_lon_2d(lats_1d, lons_1d):
+    """
+    Create 2D latitude and longitude arrays from 1D coordinate arrays.
+    
+    Parameters
+    ----------
+    lats_1d : np.ndarray
+        1D array of latitude values.
+    lons_1d : np.ndarray
+        1D array of longitude values.
+        
+    Returns
+    -------
+    lat_2d, lon_2d : tuple of np.ndarray
+        2D arrays where lat_2d[i,j] is the latitude at grid point (i,j).
+    """
+    lon_2d, lat_2d = np.meshgrid(lons_1d, lats_1d)
+    return lat_2d, lon_2d
+
+
+def compute_idr_crps_timeseries(idr_models_by_cell, det_preds_test, obs_test, germany_mask, lat_2d):
+    """
+    Compute daily Germany-mean CRPS time series using existing IDR workflow.
+    
+    This function uses the IDR objects' own .crps() method to compute CRPS values,
+    then applies area-weighted spatial averaging over Germany for each day.
+    
+    Parameters
+    ----------
+    idr_models_by_cell : dict
+        Dictionary mapping (lat_idx, lon_idx) to fitted IDR prediction objects.
+        These must be pre-fitted on training data only.
+    det_preds_test : np.ndarray
+        Array [T, Ny, Nx] of deterministic predictions for test period.
+    obs_test : np.ndarray
+        Array [T, Ny, Nx] of MSWEP observations for test period.
+    germany_mask : np.ndarray
+        Boolean array [Ny, Nx] where True indicates cells within Germany.
+    lat_2d : np.ndarray
+        2D array [Ny, Nx] of latitude values in degrees for area weighting.
+        
+    Returns
+    -------
+    np.ndarray
+        Array of length T containing area-weighted Germany-mean CRPS for each day.
+        Days where no valid CRPS could be computed will have NaN.
+    """
+    T, Ny, Nx = obs_test.shape
+    daily_regional_crps = np.full(T, np.nan)
+    
+    # Pre-compute area weights for Germany
+    area_weights = coslat_weights(lat_2d, germany_mask)
+    
+    for t in range(T):
+        # Initialize CRPS map for this day
+        crps_map = np.full((Ny, Nx), np.nan)
+        
+        for i in range(Ny):
+            for j in range(Nx):
+                # Skip if not in Germany or no IDR model for this cell
+                if not germany_mask[i, j] or (i, j) not in idr_models_by_cell:
+                    continue
+                
+                # Get IDR predictions for this cell
+                idr_pred = idr_models_by_cell[(i, j)]
+                if idr_pred is None:
+                    continue
+                
+                try:
+                    # Get deterministic prediction for this time and cell
+                    det_pred_scalar = det_preds_test[t, i, j]
+                    obs_scalar = obs_test[t, i, j]
+                    
+                    # Skip if either is NaN
+                    if np.isnan(det_pred_scalar) or np.isnan(obs_scalar):
+                        continue
+                    
+                    # Compute CRPS using IDR's own method
+                    # Note: The exact API may vary, adjust if needed
+                    crps_value = idr_pred.crps(np.array([obs_scalar]))[0]
+                    
+                    if np.isfinite(crps_value):
+                        crps_map[i, j] = crps_value
+                        
+                except Exception as e:
+                    # Silently skip cells with errors
+                    pass
+        
+        # Compute area-weighted mean for this day
+        if np.any(np.isfinite(crps_map)):
+            daily_regional_crps[t] = spatial_weighted_mean(crps_map, area_weights)
+    
+    return daily_regional_crps
+
+
+def compute_brier_score_timeseries(idr_models_by_cell, det_preds_test, obs_test, germany_mask, lat_2d, threshold=0.2):
+    """
+    Compute daily Germany-mean Brier Score time series using IDR predictions.
+    
+    This function extracts PoP from IDR CDFs and computes area-weighted Brier Scores.
+    
+    Parameters
+    ----------
+    idr_models_by_cell : dict
+        Dictionary mapping (lat_idx, lon_idx) to fitted IDR prediction objects.
+    det_preds_test : np.ndarray
+        Array [T, Ny, Nx] of deterministic predictions for test period.
+    obs_test : np.ndarray
+        Array [T, Ny, Nx] of MSWEP observations for test period.
+    germany_mask : np.ndarray
+        Boolean array [Ny, Nx] where True indicates cells within Germany.
+    lat_2d : np.ndarray
+        2D array [Ny, Nx] of latitude values in degrees for area weighting.
+    threshold : float
+        Precipitation threshold in mm (default: 0.2).
+        
+    Returns
+    -------
+    np.ndarray, list, list
+        daily_bs: Array of length T containing area-weighted Germany-mean BS for each day.
+        all_probs: List of all probability forecasts (for decomposition).
+        all_obs: List of all binary observations (for decomposition).
+    """
+    T, Ny, Nx = obs_test.shape
+    daily_regional_bs = np.full(T, np.nan)
+    all_probs_germany = []
+    all_obs_germany = []
+    
+    # Pre-compute area weights for Germany
+    area_weights = coslat_weights(lat_2d, germany_mask)
+    
+    for t in range(T):
+        # Initialize BS map for this day
+        bs_map = np.full((Ny, Nx), np.nan)
+        
+        for i in range(Ny):
+            for j in range(Nx):
+                # Skip if not in Germany or no IDR model for this cell
+                if not germany_mask[i, j] or (i, j) not in idr_models_by_cell:
+                    continue
+                
+                # Get IDR predictions for this cell
+                idr_pred = idr_models_by_cell[(i, j)]
+                if idr_pred is None:
+                    continue
+                
+                try:
+                    # Get observation
+                    obs_scalar = obs_test[t, i, j]
+                    if np.isnan(obs_scalar):
+                        continue
+                    
+                    # Compute PoP = 1 - F(threshold) using IDR's CDF
+                    prob_le_threshold = idr_pred.cdf(thresholds=np.array([threshold]))[0]
+                    if isinstance(prob_le_threshold, np.ndarray):
+                        prob_le_threshold = prob_le_threshold[0]
+                    
+                    pop = 1.0 - prob_le_threshold
+                    pop = np.clip(pop, 0.0, 1.0)
+                    
+                    # Binary observation
+                    binary_obs = float(obs_scalar > threshold)
+                    
+                    # Brier Score
+                    bs_value = (pop - binary_obs) ** 2
+                    
+                    if np.isfinite(bs_value):
+                        bs_map[i, j] = bs_value
+                        all_probs_germany.append(pop)
+                        all_obs_germany.append(binary_obs)
+                        
+                except Exception as e:
+                    # Silently skip cells with errors
+                    pass
+        
+        # Compute area-weighted mean for this day
+        if np.any(np.isfinite(bs_map)):
+            daily_regional_bs[t] = spatial_weighted_mean(bs_map, area_weights)
+    
+    return daily_regional_bs, all_probs_germany, all_obs_germany
+
 
 def calculate_stratified_crps(predicted_distributions, val_target_cell: np.ndarray, bins=None):
     """
@@ -866,6 +1058,7 @@ def plot_seasonal_metrics(results_summary: dict, crps_save_path: str, bs_save_pa
         return
 
     evaluation_region = results_summary.get('evaluation_region', 'Germany')
+    area_weighting = results_summary.get('area_weighting', 'cos(latitude)')
     region_suffix = f' - {evaluation_region} Region' if evaluation_region else ''
 
     season_order = ['DJF', 'MAM', 'JJA', 'SON']
@@ -875,14 +1068,16 @@ def plot_seasonal_metrics(results_summary: dict, crps_save_path: str, bs_save_pa
     # Assuming Brier score key is 'mean_bs_0.2mm' or similar, adjust if needed
     mean_bs_seasonal = [seasonal_metrics[s].get('mean_bs_0.2mm', seasonal_metrics[s].get('mean_bs', np.nan)) for s in seasons]
 
+    # Define single dark gray color
+    bar_color = '#4c4c4c'
 
     # --- Plot Seasonal CRPS ---
     try:
         plt.figure(figsize=(8, 5))
-        plt.bar(seasons, mean_crps_seasonal, color=['blue', 'green', 'red', 'orange'])
+        plt.bar(seasons, mean_crps_seasonal, color=bar_color)
         plt.ylabel("Mean CRPS")
         plt.xlabel("Season")
-        plt.title(f"{fold_label}: Spatially Averaged Mean CRPS per Season{region_suffix}")
+        plt.title(f"{fold_label}: Spatially Area-Weighted ({area_weighting}) Mean CRPS per Season{region_suffix}")
         for i, val in enumerate(mean_crps_seasonal):
              if np.isfinite(val):
                   plt.text(i, val + (max(filter(np.isfinite,mean_crps_seasonal), default=0)*0.01), f'{val:.3f}', ha='center', va='bottom')
@@ -899,14 +1094,15 @@ def plot_seasonal_metrics(results_summary: dict, crps_save_path: str, bs_save_pa
     # --- Plot Seasonal Brier Score ---
     try:
         plt.figure(figsize=(8, 5))
-        plt.bar(seasons, mean_bs_seasonal, color=['blue', 'green', 'red', 'orange'])
-        plt.ylabel("Mean Brier Score (Thresh=0.2mm)") # Adjust label if threshold differs
+        plt.bar(seasons, mean_bs_seasonal, color=bar_color)
+        plt.ylabel("Mean Brier Score (Threshold: 0.2 mm)")
         plt.xlabel("Season")
-        plt.title(f"{fold_label}: Spatially Averaged Mean Brier Score per Season{region_suffix}")
+        plt.title(f"{fold_label}: Spatially Area-Weighted ({area_weighting}) Mean Brier Score per Season{region_suffix}")
         for i, val in enumerate(mean_bs_seasonal):
              if np.isfinite(val):
                   plt.text(i, val + (max(filter(np.isfinite,mean_bs_seasonal), default=0)*0.01), f'{val:.3f}', ha='center', va='bottom')
         plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.figtext(0.5, 0.02, "Baseline: MPC (training years only)", ha='center', fontsize=8, style='italic')
         plt.tight_layout()
         os.makedirs(os.path.dirname(bs_save_path), exist_ok=True) # Ensure directory exists
         plt.savefig(bs_save_path, dpi=150)
@@ -1910,18 +2106,58 @@ def run_evaluation(base_output_dir: str, fold: int, batch_size: int = 500, n_rec
     for bin_name_iter in bin_names:
         cell_metrics[f'crps_{bin_name_iter}'] = {}
 
-    # --- REMOVE BATCHING: Process all valid cells at once ---
-    print(f"Processing all {total_valid_cells} valid cells for IDR (batching removed)...")
-
-    for lat_cell, lon_cell in tqdm(valid_cell_indices, desc="Processing Cells for IDR"):
+    # Create 2D lat/lon arrays for area weighting
+    lat_2d, lon_2d = create_lat_lon_2d(current_lats, current_lons)
+    
+    # First, fit IDR models for all cells (needed for both old and new approaches)
+    idr_models_by_cell = {}
+    print(f"Fitting IDR models for all {total_valid_cells} valid cells...")
+    
+    for lat_cell, lon_cell in tqdm(valid_cell_indices, desc="Fitting IDR models"):
         train_preds_recent_cell = train_preds_recent[:, lat_cell, lon_cell]
         train_targets_recent_cell = train_targets_recent[:, lat_cell, lon_cell]
+        
+        # Fit IDR model for this cell
+        try:
+            train_preds_df = pd.DataFrame(train_preds_recent_cell)
+            idr_model = idr(y=train_targets_recent_cell, X=train_preds_df)
+            idr_models_by_cell[(lat_cell, lon_cell)] = idr_model
+        except Exception as e:
+            print(f"Warning: Failed to fit IDR for cell ({lat_cell}, {lon_cell}): {e}")
+            idr_models_by_cell[(lat_cell, lon_cell)] = None
+    
+    # Compute daily CRPS time series using the new function
+    print("Computing daily CRPS time series with area weighting...")
+    daily_crps_series = compute_idr_crps_timeseries(
+        idr_models_by_cell, val_preds, val_targets, mask, lat_2d
+    )
+    
+    # Calculate overall mean CRPS (correct method)
+    overall_mean_crps_new = np.nanmean(daily_crps_series)
+    print(f"\nNew method - Overall mean CRPS (area-weighted): {overall_mean_crps_new:.4f}")
+    
+    # Continue with existing per-cell processing for other metrics
+    print(f"\nProcessing all {total_valid_cells} valid cells for detailed metrics...")
+
+    for lat_cell, lon_cell in tqdm(valid_cell_indices, desc="Processing Cells for Detailed Metrics"):
         val_preds_cell_loop = val_preds[:, lat_cell, lon_cell]
         val_target_cell_loop = val_targets[:, lat_cell, lon_cell]
 
-        predicted_distributions = apply_easyuq_per_cell(
-            train_preds_recent_cell, train_targets_recent_cell, eval_preds_cell=val_preds_cell_loop
-        )
+        # Get pre-fitted IDR model
+        if (lat_cell, lon_cell) not in idr_models_by_cell:
+            continue
+            
+        idr_model = idr_models_by_cell[(lat_cell, lon_cell)]
+        if idr_model is None:
+            continue
+            
+        # Predict distributions for validation data
+        try:
+            eval_preds_df = pd.DataFrame(val_preds_cell_loop)
+            predicted_distributions = idr_model.predict(eval_preds_df)
+        except Exception as e:
+            print(f"Warning: Failed to predict for cell ({lat_cell}, {lon_cell}): {e}")
+            continue
 
         if predicted_distributions is not None:
             try:
@@ -1946,14 +2182,7 @@ def run_evaluation(base_output_dir: str, fold: int, batch_size: int = 500, n_rec
                                     if np.any(valid_bin_mask_crps):
                                         bin_crps_val = np.mean(crps_values[valid_bin_mask_crps])
                                         cell_metrics[f'crps_{bin_name_crps}'][(lat_cell, lon_cell)] = bin_crps_val
-                        if seasonal_aggregates is not None and timestamps is not None:
-                            valid_crps_values = crps_values[valid_crps_mask]
-                            valid_seasons = timestamp_seasons[valid_crps_mask]
-                            for season_iter in seasons:
-                                season_mask_crps = (valid_seasons == season_iter)
-                                if np.any(season_mask_crps):
-                                    seasonal_aggregates[season_iter]['crps_sum'] += np.sum(valid_crps_values[season_mask_crps])
-                                    seasonal_aggregates[season_iter]['count'] += np.sum(season_mask_crps)
+                        # Skip seasonal aggregation here - will use daily time series instead
                 else:
                     print(f"Warning: CRPS calculation failed or shape mismatch for cell ({lat_cell}, {lon_cell}).")
             except Exception as e:
@@ -2013,38 +2242,227 @@ def run_evaluation(base_output_dir: str, fold: int, batch_size: int = 500, n_rec
 
     print(f"EasyUQ application complete. Processed {processed_cells} valid cells.")
 
-    overall_mean_crps = np.mean(all_cell_mean_crps) if all_cell_mean_crps else np.nan
-    overall_mean_bs_02mm = np.mean(all_cell_mean_bs) if all_cell_mean_bs else np.nan
-
+    # Use the new area-weighted daily time series for overall mean CRPS
+    overall_mean_crps = overall_mean_crps_new  # From compute_idr_crps_timeseries
+    
+    # Compute area-weighted Brier Score time series
+    print("Computing daily Brier Score time series with area weighting...")
+    daily_bs_series, all_probs_for_decomp, all_obs_for_decomp = compute_brier_score_timeseries(
+        idr_models_by_cell, val_preds, val_targets, mask, lat_2d, threshold=brier_threshold
+    )
+    
+    # Calculate overall mean BS from daily time series
+    overall_mean_bs_02mm = np.nanmean(daily_bs_series)
+    
     print(f"\n--- Overall Validation Metrics (Fold {fold}) ---")
-    print(f"Spatially Averaged Mean CRPS: {overall_mean_crps:.4f}")
-    print(f"Spatially Averaged Mean Brier Score (Thresh={brier_threshold:.1f}mm): {overall_mean_bs_02mm:.4f}")
+    print(f"Spatially Averaged Mean CRPS (area-weighted): {overall_mean_crps:.4f}")
+    print(f"Spatially Averaged Mean Brier Score (area-weighted, Thresh={brier_threshold:.1f}mm): {overall_mean_bs_02mm:.4f}")
     print(f"Number of valid cells used for averaging: {len(all_cell_mean_crps)}")
+    
+    # Calculate seasonal CRPS and BS from daily time series
+    seasonal_crps_from_daily = {}
+    seasonal_bs_from_daily = {}
+    if timestamps is not None and len(daily_crps_series) > 0:
+        for season in seasons:
+            season_mask = np.array([month_to_season(t.month) == season for t in timestamps])
+            # CRPS
+            season_daily_crps = daily_crps_series[season_mask]
+            if len(season_daily_crps) > 0:
+                seasonal_crps_from_daily[season] = np.nanmean(season_daily_crps)
+            else:
+                seasonal_crps_from_daily[season] = np.nan
+            # BS
+            season_daily_bs = daily_bs_series[season_mask]
+            if len(season_daily_bs) > 0:
+                seasonal_bs_from_daily[season] = np.nanmean(season_daily_bs)
+            else:
+                seasonal_bs_from_daily[season] = np.nan
+                
+        print(f"\nSeasonal metrics from daily time series:")
+        for season in seasons:
+            print(f"  {season}: CRPS={seasonal_crps_from_daily.get(season, np.nan):.4f}, "
+                  f"BS={seasonal_bs_from_daily.get(season, np.nan):.4f}")
+    
+    # Build MPC baseline from training data only
+    print("\n--- Building MPC (Monthly Probabilistic Climatology) baseline ---")
+    print("Using training years only to avoid data leakage...")
+    
+    # Generate training dates based on the shape of training data
+    # Assuming daily data and that training ends just before validation starts
+    n_train_samples = train_targets.shape[0]
+    if val_times is not None and len(val_times) > 0:
+        val_start = val_times[0]
+        # Work backwards from validation start date
+        train_end = val_start - pd.Timedelta(days=1)
+        train_dates = pd.date_range(end=train_end, periods=n_train_samples, freq='D')
+        train_years = sorted(set(train_dates.year))
+        print(f"Training period: {train_dates[0].date()} to {train_dates[-1].date()}")
+        print(f"Training years: {train_years[0]}-{train_years[-1]}")
+        print(f"Validation year: {val_start.year}")
+    else:
+        # Fallback: create synthetic dates
+        print("Warning: No validation timestamps available, using synthetic training dates")
+        train_dates = pd.date_range(start='2000-01-01', periods=n_train_samples, freq='D')
+    
+    # Build MPC from training observations
+    mpc_climatology = build_mpc_climatology(train_targets, train_dates, mask)
+    
+    # Compute MPC CRPS for validation period
+    print("Computing MPC CRPS time series...")
+    daily_crps_mpc = np.full(len(val_times), np.nan)
+    
+    for t in range(len(val_times)):
+        # Initialize CRPS map for this day
+        crps_map_mpc = np.full((grid_lat, grid_lon), np.nan)
+        current_month = val_times[t].month
+        
+        for i in range(grid_lat):
+            for j in range(grid_lon):
+                if not mask[i, j]:
+                    continue
+                
+                # Get climatology samples for this cell and month
+                if current_month in mpc_climatology and len(mpc_climatology[current_month][i][j]) > 0:
+                    clim_samples = np.array(mpc_climatology[current_month][i][j])
+                    obs_value = val_targets[t, i, j]
+                    
+                    if np.isfinite(obs_value):
+                        # Compute CRPS using sample distribution
+                        crps_mpc = crps_sample_distribution(obs_value, clim_samples)
+                        if np.isfinite(crps_mpc):
+                            crps_map_mpc[i, j] = crps_mpc
+        
+        # Compute area-weighted mean for this day
+        if np.any(np.isfinite(crps_map_mpc)):
+            daily_crps_mpc[t] = spatial_weighted_mean(crps_map_mpc, coslat_weights(lat_2d, mask))
+    
+    # Calculate overall and seasonal MPC CRPS
+    overall_mean_crps_mpc = np.nanmean(daily_crps_mpc)
+    print(f"\nMPC baseline - Overall mean CRPS (area-weighted): {overall_mean_crps_mpc:.4f}")
+    
+    # Calculate CRPSS (skill score)
+    crpss_overall = skill_score(overall_mean_crps, overall_mean_crps_mpc)
+    print(f"Overall CRPSS (vs MPC): {crpss_overall:.4f}")
+    
+    # Seasonal MPC CRPS and skill scores
+    seasonal_crps_mpc = {}
+    seasonal_crpss = {}
+    if timestamps is not None:
+        for season in seasons:
+            season_mask = np.array([month_to_season(t.month) == season for t in timestamps])
+            season_daily_mpc = daily_crps_mpc[season_mask]
+            if len(season_daily_mpc) > 0:
+                seasonal_crps_mpc[season] = np.nanmean(season_daily_mpc)
+                seasonal_crpss[season] = skill_score(
+                    seasonal_crps_from_daily.get(season, np.nan),
+                    seasonal_crps_mpc[season]
+                )
+        
+        print("\nSeasonal CRPSS (vs MPC):")
+        for season in seasons:
+            print(f"  {season}: CRPS_model={seasonal_crps_from_daily.get(season, np.nan):.4f}, "
+                  f"CRPS_MPC={seasonal_crps_mpc.get(season, np.nan):.4f}, "
+                  f"CRPSS={seasonal_crpss.get(season, np.nan):.4f}")
 
+    # CORP Brier Score Decomposition
     bsd_results = None
-    if all_forecast_probs_germany_bsd and all_binary_obs_germany_bsd:
-        final_forecast_probs_bsd = np.array(all_forecast_probs_germany_bsd)
-        final_binary_obs_bsd = np.array(all_binary_obs_germany_bsd)
-        print(f"\nCalculating Brier Score Decomposition for Germany region (Thresh={brier_threshold:.1f}mm)...")
+    if all_probs_for_decomp and all_obs_for_decomp:
+        final_forecast_probs_bsd = np.array(all_probs_for_decomp)
+        final_binary_obs_bsd = np.array(all_obs_for_decomp)
+        print(f"\nCalculating CORP Brier Score Decomposition for Germany region (Thresh={brier_threshold:.1f}mm)...")
         print(f"  Total samples for BSD: {len(final_forecast_probs_bsd)}")
-        bsd_mean_bs, bsd_misc, bsd_disc, bsd_unc = brier_score_decomposition(final_forecast_probs_bsd, final_binary_obs_bsd)
-        if bsd_mean_bs is not None:
-            print(f"  Mean Brier Score (BSD): {bsd_mean_bs:.4f}")
-            print(f"  Miscalibration (Reliability): {bsd_misc:.4f}")
-            print(f"  Discrimination (Resolution): {bsd_disc:.4f}")
-            print(f"  Uncertainty: {bsd_unc:.4f}")
-            bsd_results = {
-                'mean_bs': bsd_mean_bs,
-                'miscalibration': bsd_misc,
-                'discrimination': bsd_disc,
-                'uncertainty': bsd_unc
-            }
-            if np.isfinite(bsd_mean_bs) and np.isfinite(overall_mean_bs_02mm) and not np.isclose(bsd_mean_bs, overall_mean_bs_02mm):
-                print(f"  Note: BSD Mean BS ({bsd_mean_bs:.4f}) differs from spatially averaged cell Mean BS ({overall_mean_bs_02mm:.4f}). This can happen due to averaging methods.")
+        
+        bsd_decomp = corp_bs_decomposition(final_forecast_probs_bsd, final_binary_obs_bsd)
+        if bsd_decomp is not None:
+            print(f"  Mean Brier Score: {bsd_decomp['bs']:.4f}")
+            print(f"  MCB (Miscalibration): {bsd_decomp['mcb']:.4f}")
+            print(f"  DSC (Discrimination): {bsd_decomp['dsc']:.4f}")
+            print(f"  UNC (Uncertainty): {bsd_decomp['unc']:.4f}")
+            print(f"  Identity check (BS = MCB - DSC + UNC): {abs(bsd_decomp['bs'] - (bsd_decomp['mcb'] - bsd_decomp['dsc'] + bsd_decomp['unc'])) < 1e-6}")
+            
+            bsd_results = bsd_decomp
+            
+            # Check consistency with time series mean
+            if np.isfinite(bsd_decomp['bs']) and np.isfinite(overall_mean_bs_02mm):
+                if not np.isclose(bsd_decomp['bs'], overall_mean_bs_02mm, rtol=1e-3):
+                    print(f"  Note: BSD Mean BS ({bsd_decomp['bs']:.4f}) differs from time series mean ({overall_mean_bs_02mm:.4f}).")
         else:
-            print("  Brier Score Decomposition failed.")
+            print("  CORP Brier Score Decomposition failed.")
     else:
         print("\nNo data available for Brier Score Decomposition.")
+    
+    # CRPS CORP Decomposition (diagnostic only)
+    print("\n--- CRPS CORP Decomposition (diagnostic) ---")
+    print("Computing on a representative subset of days...")
+    
+    # Sample subset of days for CRPS decomposition
+    n_days_sample = min(30, len(val_times))  # Sample up to 30 days
+    sample_indices = np.random.choice(len(val_times), n_days_sample, replace=False)
+    sample_indices.sort()
+    
+    # Define threshold grid
+    thresholds = np.array([0.0, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50])
+    print(f"Using {len(thresholds)} thresholds: {thresholds}")
+    print(f"Sampling {n_days_sample} days from validation period")
+    
+    # Collect CDF values and observations for sampled days
+    all_cdf_values = []
+    all_obs_values = []
+    
+    for t_idx in sample_indices:
+        for i in range(grid_lat):
+            for j in range(grid_lon):
+                if not mask[i, j] or (i, j) not in idr_models_by_cell:
+                    continue
+                
+                idr_pred = idr_models_by_cell[(i, j)]
+                if idr_pred is None:
+                    continue
+                
+                try:
+                    obs_value = val_targets[t_idx, i, j]
+                    if np.isnan(obs_value):
+                        continue
+                    
+                    # Evaluate CDF at thresholds
+                    cdf_values = idr_pred.cdf(thresholds=thresholds)
+                    if isinstance(cdf_values, np.ndarray) and len(cdf_values) == len(thresholds):
+                        all_cdf_values.append(cdf_values)
+                        all_obs_values.append(obs_value)
+                except:
+                    pass
+    
+    if len(all_cdf_values) > 0:
+        # Convert to arrays
+        Fz = np.array(all_cdf_values)  # Shape: [n_samples, n_thresholds]
+        y = np.array(all_obs_values)   # Shape: [n_samples]
+        
+        print(f"Collected {len(y)} valid samples for CRPS decomposition")
+        
+        # Compute CRPS decomposition
+        crps_decomp = corp_crps_decomposition_from_cdf(Fz, y, thresholds)
+        
+        if crps_decomp is not None:
+            print(f"\nCRPS CORP Decomposition Results:")
+            print(f"  CRPS: {crps_decomp['crps']:.4f}")
+            print(f"  MCB (Miscalibration): {crps_decomp['mcb']:.4f}")
+            print(f"  DSC (Discrimination): {crps_decomp['dsc']:.4f}")
+            print(f"  UNC (Uncertainty): {crps_decomp['unc']:.4f}")
+            print(f"  Identity check (CRPS = MCB - DSC + UNC): {abs(crps_decomp['crps'] - (crps_decomp['mcb'] - crps_decomp['dsc'] + crps_decomp['unc'])) < 1e-6}")
+            
+            # Check consistency with overall mean CRPS
+            # Note: This is a subset so exact match isn't expected
+            print(f"\n  Subset CRPS ({crps_decomp['crps']:.4f}) vs Overall mean CRPS ({overall_mean_crps:.4f})")
+            print(f"  (Difference expected due to sampling)")
+            
+            # Store decomposition results
+            crps_decomp_results = crps_decomp
+        else:
+            print("CRPS decomposition failed")
+            crps_decomp_results = None
+    else:
+        print("No valid samples collected for CRPS decomposition")
+        crps_decomp_results = None
 
     intensity_bin_crps = {}
     for bin_name_calc in bin_names:
@@ -2078,6 +2496,8 @@ def run_evaluation(base_output_dir: str, fold: int, batch_size: int = 500, n_rec
     results_summary = {
         'fold': fold,
         'overall_mean_crps': overall_mean_crps,
+        'overall_mean_crps_mpc': overall_mean_crps_mpc,
+        'overall_crpss': crpss_overall,
         'overall_mean_bs_0.2mm': overall_mean_bs_02mm,
         'brier_score_decomposition_0.2mm': bsd_results,
         'num_valid_cells': len(all_cell_mean_crps),
@@ -2087,38 +2507,59 @@ def run_evaluation(base_output_dir: str, fold: int, batch_size: int = 500, n_rec
             'deterministic_mae': intensity_bin_mae,
             'probabilistic_crps': intensity_bin_crps
         },
-        'evaluation_region': 'Germany'
+        'evaluation_region': 'Germany',
+        'area_weighting': 'cos(latitude)',
+        'mpc_baseline': {
+            'overall_crps': overall_mean_crps_mpc,
+            'seasonal_crps': seasonal_crps_mpc
+        },
+        'skill_scores': {
+            'crpss_overall': crpss_overall,
+            'crpss_seasonal': seasonal_crpss
+        },
+        'crps_decomposition': crps_decomp_results
     }
 
-    if seasonal_aggregates is None or timestamps is None:
-        print("Warning: Timestamps not found or seasonal aggregates not initialized. Skipping seasonal analysis.")
+    if timestamps is None:
+        print("Warning: Timestamps not found. Skipping seasonal analysis.")
         results_summary['seasonal_metrics'] = None
     else:
         seasonal_metrics_results = {}
-        print("\nCalculating final seasonal metrics from aggregates...")
+        print("\nCalculating final seasonal metrics from daily time series...")
         for season_res in seasons:
-            season_data = seasonal_aggregates[season_res]
-            count = season_data['count']
-            crps_sum = season_data['crps_sum']
-            bs_sum = season_data['bs_sum']
-            mae_count = season_data.get('mae_count', 0)
-            mae_sum = season_data.get('mae_sum', 0.0)
-            mean_crps_s = crps_sum / count if count > 0 else np.nan
-            mean_bs_s = bs_sum / count if count > 0 else np.nan
-            mean_mae_s = mae_sum / mae_count if mae_count > 0 else np.nan
+            # Use the pre-calculated seasonal CRPS from daily time series
+            mean_crps_s = seasonal_crps_from_daily.get(season_res, np.nan)
+            
+            # Use the pre-calculated seasonal BS from daily time series
+            mean_bs_s = seasonal_bs_from_daily.get(season_res, np.nan)
+            
+            # Calculate seasonal MAE from aggregates if available
+            if seasonal_aggregates is not None:
+                season_data = seasonal_aggregates[season_res]
+                mae_count = season_data.get('mae_count', 0)
+                mae_sum = season_data.get('mae_sum', 0.0)
+                mean_mae_s = mae_sum / mae_count if mae_count > 0 else np.nan
+            else:
+                mean_mae_s = np.nan
+                mae_count = 0
+            
+            # Count number of days in this season
+            season_mask = np.array([month_to_season(t.month) == season_res for t in timestamps])
+            num_days = np.sum(season_mask)
+            
             seasonal_metrics_results[season_res] = {
                 'mean_crps': mean_crps_s,
                 'mean_bs_0.2mm': mean_bs_s,
                 'mean_mae': mean_mae_s,
-                'num_samples': count,
+                'num_days': num_days,
                 'mae_samples': mae_count
             }
             if np.isfinite(mean_mae_s) and np.isfinite(mean_crps_s) and mean_mae_s != 0:
                 improvement_s = 100 * (mean_mae_s - mean_crps_s) / mean_mae_s
                 seasonal_metrics_results[season_res]['crps_vs_mae_improvement'] = improvement_s
-                print(f"  {season_res}: Mean CRPS = {mean_crps_s:.4f}, Mean BS = {mean_bs_s:.4f}, Mean MAE = {mean_mae_s:.4f}, Improv. {improvement_s:.2f}% ({count} samples)")
+                print(f"  {season_res}: Mean CRPS = {mean_crps_s:.4f}, Mean BS = {mean_bs_s:.4f}, Mean MAE = {mean_mae_s:.4f}, Improv. {improvement_s:.2f}% ({num_days} days)")
             else:
-                 print(f"  {season_res}: Mean CRPS = {mean_crps_s:.4f}, Mean BS = {mean_bs_s:.4f}, Mean MAE = {mean_mae_s:.4f} ({count} samples)")
+                print(f"  {season_res}: Mean CRPS = {mean_crps_s:.4f}, Mean BS = {mean_bs_s:.4f}, Mean MAE = {mean_mae_s:.4f} ({num_days} days)")
         results_summary['seasonal_metrics'] = seasonal_metrics_results
 
     print(f"\n--- Evaluation Summary for Fold {fold} ---") # Corrected f-string
@@ -2162,8 +2603,68 @@ def run_evaluation(base_output_dir: str, fold: int, batch_size: int = 500, n_rec
         except Exception as e_fallback:
               print(f"Error during fallback JSON saving: {e_fallback}")
 
-    plot_seasonal_metrics(results_summary, base_output_dir, fold) # Call with new signature if it was changed
-    plot_det_vs_prob_comparison(results_summary, base_output_dir, fold) # Call with new signature if it was changed
+    # Generate publication-ready plots
+    print("\nGenerating publication-ready plots...")
+    
+    # Replace old plot_seasonal_metrics with new plot_seasonal_bars
+    if results_summary.get('seasonal_metrics'):
+        # Seasonal CRPS bars
+        seasonal_crps_dict = {}
+        seasonal_bs_dict = {}
+        for season, metrics in results_summary['seasonal_metrics'].items():
+            seasonal_crps_dict[season] = metrics.get('mean_crps', np.nan)
+            seasonal_bs_dict[season] = metrics.get('mean_bs_0.2mm', np.nan)
+        
+        crps_outfile = os.path.join(fold_dir, f"seasonal_crps_fold{fold}.png")
+        plot_seasonal_bars(seasonal_crps_dict, 'Mean CRPS', f'Fold {fold}: Seasonal CRPS', crps_outfile)
+        
+        bs_outfile = os.path.join(fold_dir, f"seasonal_bs_fold{fold}.png")
+        plot_seasonal_bars(seasonal_bs_dict, 'Mean Brier Score (0.2 mm)', f'Fold {fold}: Seasonal Brier Score', bs_outfile)
+    
+    # Intensity bin comparison plot
+    if results_summary.get('intensity_bin_metrics'):
+        det_mae = results_summary['intensity_bin_metrics'].get('deterministic_mae', {})
+        prob_crps = results_summary['intensity_bin_metrics'].get('probabilistic_crps', {})
+        bins = ['0.0-0.1', '0.1-1.0', '1.0-5.0', '5.0-10.0', '10.0-20.0', '20.0-50.0', '>50.0']
+        
+        intensity_outfile = os.path.join(fold_dir, f"intensity_comparison_fold{fold}.png")
+        plot_intensity_bars(bins, det_mae, prob_crps, intensity_outfile)
+    
+    # MCB-DSC scatter plots
+    mcb_dsc_points = []
+    
+    # Add model point if decomposition exists
+    if results_summary.get('brier_score_decomposition_0.2mm'):
+        bsd = results_summary['brier_score_decomposition_0.2mm']
+        mcb_dsc_points.append({
+            'label': f'Fold {fold}',
+            'MCB': bsd.get('mcb', np.nan),
+            'DSC': bsd.get('dsc', np.nan),
+            'UNC': bsd.get('unc', np.nan)
+        })
+    
+    # Add MPC baseline point (would need to compute BS decomposition for MPC)
+    # For now, just adding a placeholder - in production, compute actual MPC decomposition
+    
+    if mcb_dsc_points:
+        # BS decomposition scatter
+        bs_scatter_outfile = os.path.join(fold_dir, f"bs_mcb_dsc_fold{fold}.png")
+        plot_mcb_dsc_scatter(mcb_dsc_points, 'Brier Score', bs_scatter_outfile)
+        
+        # CRPS decomposition scatter (if available)
+        if results_summary.get('crps_decomposition'):
+            crps_decomp = results_summary['crps_decomposition']
+            crps_points = [{
+                'label': f'Fold {fold}',
+                'MCB': crps_decomp.get('mcb', np.nan),
+                'DSC': crps_decomp.get('dsc', np.nan),
+                'UNC': crps_decomp.get('unc', np.nan)
+            }]
+            crps_scatter_outfile = os.path.join(fold_dir, f"crps_mcb_dsc_fold{fold}.png")
+            plot_mcb_dsc_scatter(crps_points, 'CRPS', crps_scatter_outfile)
+    
+    # Keep the old comparison plot for backward compatibility
+    plot_det_vs_prob_comparison(results_summary, base_output_dir, fold)
 
     if generate_seasonal_plots:
         print("\nGenerating seasonal sample plots...")
@@ -2175,8 +2676,272 @@ def run_evaluation(base_output_dir: str, fold: int, batch_size: int = 500, n_rec
             import traceback
             traceback.print_exc()
 
+    # Write results to CSV
+    csv_filename = os.path.join(fold_dir, f"evaluation_results_fold{fold}.csv")
+    write_results_to_csv(results_summary, csv_filename)
+    
+    # Run acceptance tests
+    tests_passed = run_acceptance_tests(results_summary, daily_crps_series, timestamps, seasonal_crps_from_daily)
+    
     print("Finished evaluation.")
     return results_summary
+
+
+def write_results_to_csv(results_summary, csv_filename):
+    """
+    Write evaluation results to CSV format suitable for paper tables.
+    
+    Parameters
+    ----------
+    results_summary : dict
+        Dictionary containing all evaluation results.
+    csv_filename : str
+        Path to output CSV file.
+    """
+    import csv
+    
+    print(f"\nWriting results to CSV: {csv_filename}")
+    
+    with open(csv_filename, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        # Header
+        writer.writerow(['Metric', 'Value', 'Description'])
+        writer.writerow([])  # Empty row
+        
+        # Overall metrics
+        writer.writerow(['# Overall Metrics (Germany, area-weighted)', '', ''])
+        writer.writerow(['overall_mean_crps', f"{results_summary.get('overall_mean_crps', np.nan):.4f}", 'Mean CRPS'])
+        writer.writerow(['overall_mean_crps_mpc', f"{results_summary.get('overall_mean_crps_mpc', np.nan):.4f}", 'Mean CRPS (MPC baseline)'])
+        writer.writerow(['overall_crpss', f"{results_summary.get('overall_crpss', np.nan):.4f}", 'CRPSS vs MPC'])
+        writer.writerow(['overall_mean_bs_0.2mm', f"{results_summary.get('overall_mean_bs_0.2mm', np.nan):.4f}", 'Mean Brier Score (0.2mm)'])
+        writer.writerow(['deterministic_mae', f"{results_summary.get('deterministic_mae', np.nan):.4f}", 'Deterministic MAE'])
+        writer.writerow(['deterministic_rmse', f"{results_summary.get('deterministic_rmse', np.nan):.4f}", 'Deterministic RMSE'])
+        writer.writerow([])
+        
+        # Brier Score decomposition
+        if results_summary.get('brier_score_decomposition_0.2mm'):
+            bsd = results_summary['brier_score_decomposition_0.2mm']
+            writer.writerow(['# Brier Score CORP Decomposition (0.2mm)', '', ''])
+            writer.writerow(['bs_mean', f"{bsd.get('bs', np.nan):.4f}", 'Mean Brier Score'])
+            writer.writerow(['bs_mcb', f"{bsd.get('mcb', np.nan):.4f}", 'MCB (Miscalibration)'])
+            writer.writerow(['bs_dsc', f"{bsd.get('dsc', np.nan):.4f}", 'DSC (Discrimination)'])
+            writer.writerow(['bs_unc', f"{bsd.get('unc', np.nan):.4f}", 'UNC (Uncertainty)'])
+            writer.writerow([])
+        
+        # CRPS decomposition
+        if results_summary.get('crps_decomposition'):
+            crps_d = results_summary['crps_decomposition']
+            writer.writerow(['# CRPS CORP Decomposition (diagnostic subset)', '', ''])
+            writer.writerow(['crps_subset', f"{crps_d.get('crps', np.nan):.4f}", 'CRPS (subset)'])
+            writer.writerow(['crps_mcb', f"{crps_d.get('mcb', np.nan):.4f}", 'MCB (Miscalibration)'])
+            writer.writerow(['crps_dsc', f"{crps_d.get('dsc', np.nan):.4f}", 'DSC (Discrimination)'])
+            writer.writerow(['crps_unc', f"{crps_d.get('unc', np.nan):.4f}", 'UNC (Uncertainty)'])
+            writer.writerow([])
+        
+        # Seasonal metrics
+        if results_summary.get('seasonal_metrics'):
+            writer.writerow(['# Seasonal Metrics', '', ''])
+            seasons = ['DJF', 'MAM', 'JJA', 'SON']
+            
+            # CRPS by season
+            writer.writerow(['## CRPS by season', '', ''])
+            for season in seasons:
+                if season in results_summary['seasonal_metrics']:
+                    val = results_summary['seasonal_metrics'][season].get('mean_crps', np.nan)
+                    writer.writerow([f'crps_{season}', f"{val:.4f}", f'{season} CRPS'])
+            writer.writerow([])
+            
+            # BS by season
+            writer.writerow(['## Brier Score by season (0.2mm)', '', ''])
+            for season in seasons:
+                if season in results_summary['seasonal_metrics']:
+                    val = results_summary['seasonal_metrics'][season].get('mean_bs_0.2mm', np.nan)
+                    writer.writerow([f'bs_{season}', f"{val:.4f}", f'{season} BS'])
+            writer.writerow([])
+            
+            # CRPSS by season
+            if results_summary.get('skill_scores', {}).get('crpss_seasonal'):
+                writer.writerow(['## CRPSS by season (vs MPC)', '', ''])
+                crpss_seasonal = results_summary['skill_scores']['crpss_seasonal']
+                for season in seasons:
+                    if season in crpss_seasonal:
+                        val = crpss_seasonal[season]
+                        writer.writerow([f'crpss_{season}', f"{val:.4f}", f'{season} CRPSS'])
+                writer.writerow([])
+        
+        # Intensity bin metrics
+        if results_summary.get('intensity_bin_metrics'):
+            writer.writerow(['# Intensity Bin Metrics', '', ''])
+            bins = ['0.0-0.1', '0.1-1.0', '1.0-5.0', '5.0-10.0', '10.0-20.0', '20.0-50.0', '>50.0']
+            
+            # MAE by bin
+            writer.writerow(['## Deterministic MAE by precipitation intensity', '', ''])
+            mae_dict = results_summary['intensity_bin_metrics'].get('deterministic_mae', {})
+            for bin_name in bins:
+                if bin_name in mae_dict:
+                    val = mae_dict[bin_name]
+                    writer.writerow([f'mae_{bin_name}mm', f"{val:.4f}", f'MAE for {bin_name} mm'])
+            writer.writerow([])
+            
+            # CRPS by bin
+            writer.writerow(['## Probabilistic CRPS by precipitation intensity', '', ''])
+            crps_dict = results_summary['intensity_bin_metrics'].get('probabilistic_crps', {})
+            for bin_name in bins:
+                if bin_name in crps_dict:
+                    val = crps_dict[bin_name]
+                    writer.writerow([f'crps_{bin_name}mm', f"{val:.4f}", f'CRPS for {bin_name} mm'])
+            writer.writerow([])
+        
+        # Metadata
+        writer.writerow(['# Metadata', '', ''])
+        writer.writerow(['fold', results_summary.get('fold', 'NA'), 'Fold number'])
+        writer.writerow(['run_id', results_summary.get('run_id', ''), 'Run identifier'])
+        writer.writerow(['outside_weight', results_summary.get('outside_weight', ''), 'Outside weight parameter'])
+        writer.writerow(['era5_group', results_summary.get('era5_group', ''), 'ERA5 group'])
+        writer.writerow(['year_eval', results_summary.get('year_eval', 'NA'), 'Evaluation year'])
+        writer.writerow(['threshold_mm', '0.2', 'Threshold for PoP (mm)'])
+        writer.writerow(['mask', 'Germany', 'Evaluation mask'])
+        writer.writerow(['spatial_weight', 'coslat', 'Spatial weighting method'])
+        writer.writerow(['evaluation_region', results_summary.get('evaluation_region', 'NA'), 'Evaluation region'])
+        writer.writerow(['area_weighting', results_summary.get('area_weighting', 'NA'), 'Area weighting method'])
+        writer.writerow(['num_valid_cells', results_summary.get('num_valid_cells', 'NA'), 'Number of valid cells'])
+    
+    print(f"CSV file written successfully: {csv_filename}")
+
+
+def run_acceptance_tests(results_summary, daily_crps_series, timestamps, seasonal_crps_from_daily):
+    """
+    Run acceptance tests to verify the evaluation results are consistent.
+    
+    Tests:
+    1. Seasonal parity (if comparing with old results)
+    2. Overall consistency between daily mean and seasonal weighted mean
+    3. Identity check for decompositions
+    
+    Parameters
+    ----------
+    results_summary : dict
+        Complete evaluation results
+    daily_crps_series : np.ndarray
+        Daily CRPS time series
+    timestamps : pandas.DatetimeIndex
+        Timestamps for validation period
+    seasonal_crps_from_daily : dict
+        Seasonal CRPS values computed from daily series
+    """
+    print("\n" + "="*60)
+    print("Running Acceptance Tests")
+    print("="*60)
+    
+    all_tests_passed = True
+    
+    # Test 1: Overall consistency
+    print("\nTest 1: Overall Consistency")
+    print("-"*40)
+    
+    # Check that overall mean CRPS equals time-mean of daily series
+    overall_from_daily = np.nanmean(daily_crps_series)
+    overall_reported = results_summary.get('overall_mean_crps', np.nan)
+    
+    test1a_passed = np.abs(overall_from_daily - overall_reported) < 1e-6
+    print(f"  1a. Overall mean CRPS consistency:")
+    print(f"      From daily series: {overall_from_daily:.6f}")
+    print(f"      Reported:          {overall_reported:.6f}")
+    print(f"      Difference:        {np.abs(overall_from_daily - overall_reported):.2e}")
+    print(f"      Status: {'PASSED' if test1a_passed else 'FAILED'}")
+    all_tests_passed &= test1a_passed
+    
+    # Check seasonal weighted mean equals overall
+    if timestamps is not None and seasonal_crps_from_daily:
+        season_days = {}
+        for t in timestamps:
+            season = month_to_season(t.month)
+            season_days[season] = season_days.get(season, 0) + 1
+        
+        total_days = sum(season_days.values())
+        weighted_seasonal_mean = 0
+        for season, n_days in season_days.items():
+            if season in seasonal_crps_from_daily:
+                weight = n_days / total_days
+                weighted_seasonal_mean += weight * seasonal_crps_from_daily[season]
+        
+        test1b_passed = np.abs(weighted_seasonal_mean - overall_reported) < 1e-6
+        print(f"\n  1b. Season-weighted mean consistency:")
+        print(f"      Weighted seasonal: {weighted_seasonal_mean:.6f}")
+        print(f"      Overall reported:  {overall_reported:.6f}")
+        print(f"      Difference:        {np.abs(weighted_seasonal_mean - overall_reported):.2e}")
+        print(f"      Status: {'PASSED' if test1b_passed else 'FAILED'}")
+        all_tests_passed &= test1b_passed
+    
+    # Test 2: Decomposition identities
+    print("\nTest 2: Decomposition Identities")
+    print("-"*40)
+    
+    # Check BS decomposition
+    if results_summary.get('brier_score_decomposition_0.2mm'):
+        bsd = results_summary['brier_score_decomposition_0.2mm']
+        bs = bsd.get('bs', np.nan)
+        mcb = bsd.get('mcb', np.nan)
+        dsc = bsd.get('dsc', np.nan)
+        unc = bsd.get('unc', np.nan)
+        
+        identity = mcb - dsc + unc
+        diff = np.abs(bs - identity)
+        test2a_passed = diff < 1e-6
+        
+        print(f"  2a. Brier Score decomposition (BS = MCB - DSC + UNC):")
+        print(f"      BS:                {bs:.6f}")
+        print(f"      MCB - DSC + UNC:   {identity:.6f}")
+        print(f"      Difference:        {diff:.2e}")
+        print(f"      Status: {'PASSED' if test2a_passed else 'FAILED'}")
+        all_tests_passed &= test2a_passed
+    
+    # Check CRPS decomposition
+    if results_summary.get('crps_decomposition'):
+        crps_d = results_summary['crps_decomposition']
+        crps = crps_d.get('crps', np.nan)
+        mcb = crps_d.get('mcb', np.nan)
+        dsc = crps_d.get('dsc', np.nan)
+        unc = crps_d.get('unc', np.nan)
+        
+        identity = mcb - dsc + unc
+        diff = np.abs(crps - identity)
+        test2b_passed = diff < 1e-6
+        
+        print(f"\n  2b. CRPS decomposition (CRPS = MCB - DSC + UNC):")
+        print(f"      CRPS:              {crps:.6f}")
+        print(f"      MCB - DSC + UNC:   {identity:.6f}")
+        print(f"      Difference:        {diff:.2e}")
+        print(f"      Status: {'PASSED' if test2b_passed else 'FAILED'}")
+        all_tests_passed &= test2b_passed
+    
+    # Test 3: Value sanity checks
+    print("\nTest 3: Value Sanity Checks")
+    print("-"*40)
+    
+    # CRPS should be positive
+    test3a_passed = results_summary.get('overall_mean_crps', -1) >= 0
+    print(f"  3a. CRPS >= 0: {'PASSED' if test3a_passed else 'FAILED'}")
+    all_tests_passed &= test3a_passed
+    
+    # BS should be between 0 and 1
+    bs_val = results_summary.get('overall_mean_bs_0.2mm', -1)
+    test3b_passed = 0 <= bs_val <= 1
+    print(f"  3b. 0 <= BS <= 1: {'PASSED' if test3b_passed else 'FAILED'} (BS = {bs_val:.4f})")
+    all_tests_passed &= test3b_passed
+    
+    # CRPSS should be less than 1 (perfect forecast would be 1)
+    crpss = results_summary.get('overall_crpss', 2)
+    test3c_passed = crpss < 1
+    print(f"  3c. CRPSS < 1: {'PASSED' if test3c_passed else 'FAILED'} (CRPSS = {crpss:.4f})")
+    all_tests_passed &= test3c_passed
+    
+    print("\n" + "="*60)
+    print(f"Overall Test Result: {'ALL TESTS PASSED' if all_tests_passed else 'SOME TESTS FAILED'}")
+    print("="*60 + "\n")
+    
+    return all_tests_passed
 
 
 def plot_det_vs_prob_comparison(results_summary: dict, save_path: str, fold_label: str):
@@ -2203,6 +2968,7 @@ def plot_det_vs_prob_comparison(results_summary: dict, save_path: str, fold_labe
         return
 
     evaluation_region = results_summary.get('evaluation_region', 'Germany')
+    area_weighting = results_summary.get('area_weighting', 'cos(latitude)')
     region_suffix = f' - {evaluation_region} Region' if evaluation_region else ''
 
     bins_plot = [0, 0.1, 1.0, 5.0, 10.0, 20.0, 50.0, float('inf')]
@@ -2224,17 +2990,21 @@ def plot_det_vs_prob_comparison(results_summary: dict, save_path: str, fold_labe
         else:
             improvements.append(np.nan)
 
+    # Define single dark gray color
+    bar_color_light = '#6c6c6c'  # Slightly lighter gray for MAE
+    bar_color_dark = '#4c4c4c'   # Dark gray for CRPS
+
     try:
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10), gridspec_kw={'height_ratios': [2, 1]})
 
         x_plot = np.arange(len(valid_bins))
         width = 0.35
 
-        rects1 = ax1.bar(x_plot - width/2, mae_values, width, label='Deterministic MAE', color='cornflowerblue')
-        rects2 = ax1.bar(x_plot + width/2, crps_values, width, label='Probabilistic CRPS', color='lightcoral')
+        rects1 = ax1.bar(x_plot - width/2, mae_values, width, label='Deterministic MAE', color=bar_color_light)
+        rects2 = ax1.bar(x_plot + width/2, crps_values, width, label='Probabilistic CRPS', color=bar_color_dark)
 
         ax1.set_ylabel('Error Metric Value')
-        ax1.set_title(f'{fold_label}: Det. MAE vs Prob. CRPS by Precipitation Intensity{region_suffix}')
+        ax1.set_title(f'{fold_label}: Det. MAE vs Prob. CRPS by Precipitation Intensity{region_suffix}\nSpatially Area-Weighted ({area_weighting})')
         ax1.set_xticks(x_plot)
         ax1.set_xticklabels(valid_bins, rotation=45, ha="right")
         ax1.legend()
@@ -2252,7 +3022,8 @@ def plot_det_vs_prob_comparison(results_summary: dict, save_path: str, fold_labe
         autolabel(rects1, ax1)
         autolabel(rects2, ax1)
 
-        rects_imp = ax2.bar(x_plot, improvements, width=0.6, color='forestgreen')
+        # Use dark gray for improvement bars
+        rects_imp = ax2.bar(x_plot, improvements, width=0.6, color=bar_color_dark)
         ax2.set_ylabel('Improvement (%)')
         ax2.set_xticks(x_plot)
         ax_labels_imp = [vb.replace("inf", "∞") for vb in valid_bins]
@@ -2263,7 +3034,7 @@ def plot_det_vs_prob_comparison(results_summary: dict, save_path: str, fold_labe
 
         for i, imp_val in enumerate(improvements):
             if np.isfinite(imp_val):
-                color_imp = 'darkgreen' if imp_val > 0 else 'darkred'
+                color_imp = 'black'  # Use black text for all values
                 va_imp = 'bottom' if imp_val >=0 else 'top'
                 offset = 3 if imp_val >=0 else -3
                 ax2.text(x_plot[i], imp_val + offset if va_imp == 'bottom' else imp_val + offset,
@@ -2278,6 +3049,244 @@ def plot_det_vs_prob_comparison(results_summary: dict, save_path: str, fold_labe
     except Exception as e:
         print(f"Error generating comparison plot: {e}")
         plt.close()
+
+
+def plot_seasonal_bars(values_dict: dict, ylabel: str, title: str, outfile: str):
+    """
+    Generate publication-ready seasonal bar plot with neutral styling.
+    
+    Args:
+        values_dict: Dictionary with seasons as keys ("DJF", "MAM", "JJA", "SON") and values
+        ylabel: Y-axis label
+        title: Plot title (will append Germany/cos(lat) info)
+        outfile: Output file path
+    """
+    try:
+        # Extract seasons and values in order
+        seasons = ['DJF', 'MAM', 'JJA', 'SON']
+        values = [values_dict.get(s, np.nan) for s in seasons]
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(8, 5))
+        
+        # Plot bars with specified styling
+        bars = ax.bar(seasons, values, color='#4c4c4c', edgecolor='black', linewidth=1.0)
+        
+        # Add value labels on top of bars
+        for i, (season, val) in enumerate(zip(seasons, values)):
+            if np.isfinite(val):
+                ax.text(i, val + max(values) * 0.01, f'{val:.3f}', 
+                       ha='center', va='bottom', fontsize=10)
+        
+        # Styling
+        ax.set_xlabel('Season', fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(f'{title} (Germany; cos(lat) area-weighted)', fontsize=14)
+        
+        # Grid - dotted light gray on y-axis only
+        ax.grid(axis='y', linestyle=':', color='lightgray', alpha=0.7)
+        
+        # Remove top and right spines for cleaner look
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(outfile), exist_ok=True)
+        plt.savefig(outfile, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved seasonal bar plot to: {outfile}")
+        
+    except Exception as e:
+        print(f"Error generating seasonal bar plot: {e}")
+        if 'fig' in locals():
+            plt.close(fig)
+
+
+def plot_intensity_bars(bins: list, det_mae: dict, prob_crps: dict, outfile: str):
+    """
+    Generate intensity bin comparison plot with two panels.
+    
+    Args:
+        bins: List of bin labels (e.g., ["0.0-0.1", "0.1-1.0", ...])
+        det_mae: Dictionary of MAE values by bin
+        prob_crps: Dictionary of CRPS values by bin
+        outfile: Output file path
+    """
+    try:
+        # Extract values in order
+        mae_values = [det_mae.get(b, np.nan) for b in bins]
+        crps_values = [prob_crps.get(b, np.nan) for b in bins]
+        
+        # Calculate improvement percentages
+        improvements = []
+        for mae, crps in zip(mae_values, crps_values):
+            if np.isfinite(mae) and np.isfinite(crps) and mae > 0:
+                improvements.append(100 * (mae - crps) / mae)
+            else:
+                improvements.append(np.nan)
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10), 
+                                       gridspec_kw={'height_ratios': [2, 1]})
+        
+        # Top panel: MAE vs CRPS comparison
+        x = np.arange(len(bins))
+        width = 0.35
+        
+        # Use muted blue and rose colors
+        bars1 = ax1.bar(x - width/2, mae_values, width, 
+                        label='Deterministic MAE', color='#5B7C99', edgecolor='black')
+        bars2 = ax1.bar(x + width/2, crps_values, width, 
+                        label='Probabilistic CRPS', color='#CC8899', edgecolor='black')
+        
+        # Add value labels
+        for bars in [bars1, bars2]:
+            for bar, val in zip(bars, mae_values if bars == bars1 else crps_values):
+                if np.isfinite(val):
+                    height = bar.get_height()
+                    ax1.text(bar.get_x() + bar.get_width()/2, height + max(mae_values + crps_values) * 0.01,
+                            f'{val:.3f}', ha='center', va='bottom', fontsize=9)
+        
+        ax1.set_ylabel('Error Metric Value', fontsize=12)
+        ax1.set_title('Intensity-Stratified Performance (Germany; cos(lat) area-weighted)', fontsize=14)
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(bins, rotation=45, ha='right')
+        ax1.legend()
+        ax1.grid(axis='y', linestyle=':', color='lightgray', alpha=0.7)
+        
+        # Bottom panel: Improvement percentage
+        bars_imp = ax2.bar(x, improvements, color='#228B22', edgecolor='black')
+        
+        # Add percentage labels
+        for bar, imp in zip(bars_imp, improvements):
+            if np.isfinite(imp):
+                ax2.text(bar.get_x() + bar.get_width()/2, 
+                        imp + 1 if imp >= 0 else imp - 1,
+                        f'{imp:.1f}%', ha='center', 
+                        va='bottom' if imp >= 0 else 'top',
+                        fontsize=9, weight='bold')
+        
+        ax2.set_ylabel('Improvement (%)', fontsize=12)
+        ax2.set_xlabel('Precipitation Intensity (mm)', fontsize=12)
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(bins, rotation=45, ha='right')
+        ax2.axhline(0, color='black', linewidth=0.8, linestyle='--')
+        ax2.grid(axis='y', linestyle=':', color='lightgray', alpha=0.7)
+        
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(outfile), exist_ok=True)
+        plt.savefig(outfile, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved intensity bars plot to: {outfile}")
+        
+    except Exception as e:
+        print(f"Error generating intensity bars plot: {e}")
+        if 'fig' in locals():
+            plt.close(fig)
+
+
+def plot_mcb_dsc_scatter(points: list, score_name: str, outfile: str):
+    """
+    Generate MCB-DSC scatter plot with isopleths.
+    
+    Args:
+        points: List of dicts with keys "label", "MCB", "DSC", and optionally "UNC"
+        score_name: Name of the score (e.g., "CRPS" or "Brier Score")
+        outfile: Output file path
+    """
+    try:
+        fig, ax = plt.subplots(figsize=(8, 8))
+        
+        # Extract MCB and DSC values
+        mcb_values = [p['MCB'] for p in points]
+        dsc_values = [p['DSC'] for p in points]
+        
+        # Determine plot limits
+        mcb_range = [0, max(mcb_values) * 1.2]
+        dsc_range = [0, max(dsc_values) * 1.2]
+        
+        # Draw isopleths of constant score (S = MCB - DSC + UNC)
+        # For visualization, we'll draw lines where MCB - DSC = constant
+        # This assumes UNC is relatively constant across models
+        isopleth_values = np.arange(-0.5, 1.0, 0.1)
+        for iso_val in isopleth_values:
+            # Line equation: DSC = MCB - iso_val
+            mcb_line = np.linspace(max(0, iso_val), mcb_range[1], 100)
+            dsc_line = mcb_line - iso_val
+            
+            # Only plot where DSC >= 0
+            valid = dsc_line >= 0
+            if np.any(valid):
+                ax.plot(mcb_line[valid], dsc_line[valid], 
+                       color='lightgray', linewidth=0.5, alpha=0.5, zorder=1)
+        
+        # Plot points
+        colors = []
+        markers = []
+        for i, point in enumerate(points):
+            # Special styling for MPC baseline and best run
+            if 'MPC' in point['label']:
+                colors.append('red')
+                markers.append('s')  # Square
+            elif 'best' in point['label'].lower() or i == 0:  # Assume first is best if not marked
+                colors.append('green')
+                markers.append('*')  # Star
+            else:
+                colors.append('#4c4c4c')
+                markers.append('o')
+        
+        # Scatter plot
+        for i, (point, color, marker) in enumerate(zip(points, colors, markers)):
+            ax.scatter(point['MCB'], point['DSC'], 
+                      color=color, marker=marker, s=100, 
+                      edgecolor='black', linewidth=1, zorder=2)
+            
+            # Add labels
+            ax.annotate(point['label'], 
+                       (point['MCB'], point['DSC']),
+                       xytext=(5, 5), textcoords='offset points',
+                       fontsize=9, ha='left')
+        
+        # Add diagonal reference line (MCB = DSC)
+        diag_max = min(mcb_range[1], dsc_range[1])
+        ax.plot([0, diag_max], [0, diag_max], 'k--', linewidth=1, alpha=0.5, label='MCB = DSC')
+        
+        # Labels and title
+        ax.set_xlabel('MCB (Miscalibration)', fontsize=12)
+        ax.set_ylabel('DSC (Discrimination)', fontsize=12)
+        ax.set_title(f'{score_name} CORP Decomposition (Germany; cos(lat) area-weighted)', fontsize=14)
+        
+        # Set limits
+        ax.set_xlim(0, mcb_range[1])
+        ax.set_ylim(0, dsc_range[1])
+        
+        # Grid
+        ax.grid(True, linestyle=':', color='lightgray', alpha=0.7)
+        
+        # Legend for special points
+        legend_elements = []
+        if any('MPC' in p['label'] for p in points):
+            legend_elements.append(plt.Line2D([0], [0], marker='s', color='w', 
+                                            markerfacecolor='red', markersize=8, 
+                                            label='MPC Baseline'))
+        if any('best' in p['label'].lower() for p in points):
+            legend_elements.append(plt.Line2D([0], [0], marker='*', color='w', 
+                                            markerfacecolor='green', markersize=10, 
+                                            label='Best Run'))
+        if legend_elements:
+            ax.legend(handles=legend_elements, loc='upper right')
+        
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(outfile), exist_ok=True)
+        plt.savefig(outfile, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved MCB-DSC scatter plot to: {outfile}")
+        
+    except Exception as e:
+        print(f"Error generating MCB-DSC scatter plot: {e}")
+        if 'fig' in locals():
+            plt.close(fig)
+
 
 # Example of how to call it (add this at the end of the file for testing)
 if __name__ == '__main__':

@@ -1,43 +1,71 @@
-# Documentation files
-*.md
-*.tex
-*.png
-
-# Data directories and files
-data/
-precip_data/
-precip_data - Copy/
-ERA5/data/
-ERA5/README.md
-ERA5/data_inventory.md
-ERA5/targetgrid_germany.txt
-
-# Output directories
-test_output/
-test_single_level_output/
-logs/
-
-# Python cache
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
+*.py[cod]
+*$py.class
 *.so
+.Python
+env/
+venv/
+ENV/
+.venv
 
-# IDE files
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# Data and outputs
+data/
+*.nc
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Experiment outputs
+experiment_runs/
+test_experiment_runs/
+wind_impact_study/
+test_output/
+hyperparam_search_results/
+hyperparam_search_logs/
+
+# Evaluation outputs (keep structure but not data)
+evaluation/aggregated_metrics.csv
+evaluation/group_a_metrics.csv
+evaluation/experiment_manifest.yaml
+evaluation/test_config.yaml
+evaluation/wind_impact_config.yaml
+evaluation/temp_*.yaml
+evaluation/figures/*.png
+evaluation/tables/*.tex
+
+# IDE and OS
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# OS files
 .DS_Store
-Thumbs.db
 
-# External libraries (already available on GitHub)
-isodisreg/
+# Logs
+*.log
+logs/
+lightning_logs/
+wandb/
+
+# Model checkpoints
+*.ckpt
+*.pth
+*.pt
+checkpoints/
 
 # Temporary files
 *.tmp
 *.temp
+~*
+
+# Keep directory structure
+!evaluation/figures/.gitkeep
+!evaluation/tables/.gitkeep
+!evaluation/examples/

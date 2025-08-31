@@ -1,0 +1,14 @@
+# Evaluation manifest for MSWEP precipitation forecasting runs
+# Maps run directories to metadata for batch evaluation
+
+runs:
+  - run_id: "run_20250707_110229_fold9"    # directory name or a unique label
+    path: "/home/batman/precipitation/test_output/run_20250707_110229/fold9"
+    outside_weight: 0.2
+    era5_group: "none"          # one of: none | wind_only | all
+    note: "baseline: rainfall+seasonality only"
+  - run_id: "run_20250708_084012_fold9"
+    path: "/home/batman/precipitation/test_output/run_20250708_084012/fold9"
+    outside_weight: 0.5
+    era5_group: "none"
+  # add as many as needed

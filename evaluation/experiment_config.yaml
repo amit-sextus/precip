@@ -1,0 +1,72 @@
+# Configuration file for run_experiments_and_evaluate.sh
+# Customize experiment parameters here instead of editing the script
+
+# Data directories
+data:
+  mswep_dir: "data/MSWEP_daily"
+  era5_dir: "precip_data/era5_precipitation_project/predictors"
+  output_base: "./experiment_runs"
+
+# Training parameters
+training:
+  epochs: 20
+  folds: 10
+  batch_size: 32
+  optimizer: "adamw"
+  learning_rate: 0.0001
+  lr_scheduler: "cosineannealinglr"
+  loss_type: "mae"
+  dropout: 0.2
+  weight_decay: 1e-4
+  
+  # Additional options
+  seasonal_plots: true
+  skip_crps: false  # Set to true for faster runs during testing
+
+# Experiment groups
+experiments:
+  # Group A: Regional weighting sweep
+  group_a:
+    outside_weights: [0.2, 0.5, 0.7]
+    # Optional: add more weights for finer resolution
+    # outside_weights: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  
+  # Group B: ERA5 feature configurations
+  group_b:
+    # Configurations will use best outside_weight from Group A
+    configurations:
+      none:
+        # No ERA5 features - rainfall and seasonality only
+        era5_variables: null
+        era5_pressure_levels: null
+        
+      wind_only:
+        # Wind components at standard pressure levels
+        era5_variables: ["u", "v"]
+        era5_pressure_levels: [300, 500, 700, 850]
+        
+      all:
+        # Comprehensive configuration
+        era5_variables: ["u", "v", "q", "mslp", "t2m", "tcwv"]
+        era5_pressure_levels: [300, 500, 700, 850]
+        # Optional: add more variables
+        # era5_variables: ["u", "v", "q", "mslp", "t2m", "tcwv", "sp", "z"]
+
+# Quick test mode (uncomment for faster testing)
+# test_mode:
+#   epochs: 5
+#   folds: 2
+#   group_a_weights: [0.2, 0.5]
+#   group_b_configs: ["none", "wind_only"]
+
+# Evaluation settings
+evaluation:
+  # Number of days to sample for CRPS decomposition
+  crps_decomp_sample_days: 30
+  
+  # Tolerance for acceptance tests
+  tolerance: 1e-6
+  
+  # Figure settings
+  figure_dpi: 300
+  figure_format: "png"
